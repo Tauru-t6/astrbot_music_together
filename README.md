@@ -58,7 +58,7 @@ Music Together Socket.IO -> 读取歌曲状态 -> 下载音频 -> MP3 切片 -> 
 
 ### 手动安装
 
-将仓库目录复制到 AstrBot 的插件目录，目录结构应直接包含 `main.py` 和 `metadata.yaml`：
+将 `astrbot_music_together` 仓库目录复制到 AstrBot 的插件目录，目录结构应直接包含 `main.py` 和 `metadata.yaml`：
 
 ```text
 <astrbot-data>/plugins/astrbot_plugin_music_bot/
