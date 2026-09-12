@@ -1,0 +1,13 @@
+name: astrbot_plugin_music_bot
+display_name: Music Together Companion
+author: tauru
+description: |
+  连接 Music Together 房间，按播放进度分析当前歌曲并在群聊中发送简短的实时听歌反应。
+  支持 Gemini 音频分析和可选的 AstrBot 对话收尾/聊天回复。
+version: 0.1.0
+astrbot_version: ">=4.22.0"
+support_platforms:
+  - aiocqhttp
+  - qq_official
+repo: https://github.com/Tauru-t6/music-bot
+license: MIT

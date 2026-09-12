@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+state.json
+config.json
+config.local.json
+.astrbot_key
+.env

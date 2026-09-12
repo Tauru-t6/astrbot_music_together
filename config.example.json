@@ -1,0 +1,22 @@
+{
+  "enabled": true,
+  "server_url": "http://127.0.0.1:3011",
+  "identity_secret": "",
+  "room_id": "",
+  "nickname": "小听",
+  "create_if_missing": true,
+  "gemini_endpoint": "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+  "gemini_key": "",
+  "gemini_model": "gemini-2.5-flash",
+  "proxy": "",
+  "max_reactions": 4,
+  "segment_seconds": 45,
+  "analyze_lead_seconds": 20,
+  "persona": "你叫小听。语气简短、口语化，像和用户一起听歌时随口点评。不要编造听不到的内容。",
+  "astrbot_chat_url": "http://127.0.0.1:6185/api/v1/chat",
+  "astrbot_api_key": "",
+  "astrbot_session": "music-bot",
+  "astrbot_username": "music-bot",
+  "astrbot_provider": "",
+  "reply_all_chat": true
+}
