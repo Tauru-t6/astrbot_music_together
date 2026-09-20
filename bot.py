@@ -23,12 +23,16 @@ from urllib.parse import urlencode, urlparse
 import socketio
 from curl_cffi import requests as crequests
 
-from audio_split import split_mp3_seconds
+try:
+    from .audio_split import split_mp3_seconds
+except ImportError:
+    from audio_split import split_mp3_seconds
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
 log = logging.getLogger("music-bot")
 
 BASE = Path(__file__).resolve().parent
@@ -49,6 +53,7 @@ def load_json(path: Path, default: dict) -> dict:
 
 
 def save_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)
@@ -66,23 +71,23 @@ GEMINI_ENDPOINT = CFG.get(
     "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
 )
 GEMINI_KEY = str(CFG.get("gemini_key", ""))
-GEMINI_MODEL = CFG.get("gemini_model", "gemini-3.5-flash")
+GEMINI_MODEL = CFG.get("gemini_model", "gemini-2.5-flash")
 PROXY = str(CFG.get("proxy", ""))
 MAX_REACTIONS = int(CFG.get("max_reactions", 4))
 SEGMENT_SECONDS = float(CFG.get("segment_seconds", 45))
 ANALYZE_LEAD_SECONDS = float(CFG.get("analyze_lead_seconds", 20))
 PERSONA = CFG.get(
     "persona",
-    "你叫 Tauru。性格：散漫，慢热，话少但说话直接，对大多数事态度是'行吧'。",
+    "你叫小听。语气简短、口语化，像和用户一起听歌时随口点评。不要编造听不到的内容。",
 )
 
 PROXIES = {"http": PROXY, "https": PROXY} if PROXY else None
 
 ASTRBOT_URL = str(CFG.get("astrbot_chat_url", "http://127.0.0.1:6185/api/v1/chat"))
 ASTRBOT_KEY = str(CFG.get("astrbot_api_key", ""))
-ASTRBOT_SESSION = str(CFG.get("astrbot_session", "Tauru:FriendMessage:1125961157"))
+ASTRBOT_SESSION = str(CFG.get("astrbot_session", "music-bot"))
 ASTRBOT_USER = str(CFG.get("astrbot_username", "music-bot"))
-ASTRBOT_PROVIDER = str(CFG.get("astrbot_provider", "AMD/DeepSeek-V4-Flash"))
+ASTRBOT_PROVIDER = str(CFG.get("astrbot_provider", ""))
 
 
 def issue_identity_token(secret: str, uid: str = "music-bot-01") -> str:
@@ -97,6 +102,15 @@ def issue_identity_token(secret: str, uid: str = "music-bot-01") -> str:
 
 
 IDENTITY_COOKIE = "mt_identity=" + issue_identity_token(IDENTITY_SECRET) if IDENTITY_SECRET else ""
+
+
+def set_state_path(path: Path) -> None:
+    """Move the state file (e.g. into the AstrBot plugin data dir) and reload it."""
+    global STATE_PATH, STATE
+    if STATE:
+        return  # already joined a room with the current state; keep it
+    STATE_PATH = Path(path)
+    STATE = load_json(STATE_PATH, {})
 
 
 def apply_config(config: dict) -> None:
@@ -114,7 +128,7 @@ def apply_config(config: dict) -> None:
     IDENTITY_SECRET = str(CFG.get("identity_secret", "") or "")
     GEMINI_ENDPOINT = str(CFG.get("gemini_endpoint", "") or "").strip()
     GEMINI_KEY = str(CFG.get("gemini_key", "") or "")
-    GEMINI_MODEL = str(CFG.get("gemini_model", "gemini-3.5-flash") or "gemini-3.5-flash")
+    GEMINI_MODEL = str(CFG.get("gemini_model", "gemini-2.5-flash") or "gemini-2.5-flash")
     PROXY = str(CFG.get("proxy", "") or "").strip()
     PROXIES = {"http": PROXY, "https": PROXY} if PROXY else None
     MAX_REACTIONS = max(1, min(int(CFG.get("max_reactions", 4)), 12))
@@ -123,7 +137,7 @@ def apply_config(config: dict) -> None:
     PERSONA = str(CFG.get("persona", PERSONA) or PERSONA)[:2000]
     ASTRBOT_URL = str(CFG.get("astrbot_chat_url", "http://127.0.0.1:6185/api/v1/chat") or "").strip()
     ASTRBOT_KEY = str(CFG.get("astrbot_api_key", "") or "")
-    ASTRBOT_SESSION = str(CFG.get("astrbot_session", "Tauru:FriendMessage:1125961157") or "")
+    ASTRBOT_SESSION = str(CFG.get("astrbot_session", "music-bot") or "music-bot")
     ASTRBOT_USER = str(CFG.get("astrbot_username", "music-bot") or "music-bot")
     ASTRBOT_PROVIDER = str(CFG.get("astrbot_provider", "") or "")
     REPLY_ALL_CHAT = bool(CFG.get("reply_all_chat", True))
@@ -249,6 +263,9 @@ def astrbot_chat(context_text: str, timeout: int = 90) -> str | None:
 # ---------------------------------------------------------------------------
 
 def rest_get(path: str, params: dict) -> dict | None:
+    if not IDENTITY_COOKIE:
+        log.warning("REST %s skipped: identity cookie not configured", path)
+        return None
     query = urlencode({k: v for k, v in params.items() if v not in (None, "")})
     url = SERVER.rstrip("/") + path + (("?" + query) if query else "")
     try:
@@ -517,6 +534,8 @@ async def listen_along(track: dict) -> None:
             f"（场景：我们刚一起听完《{title}》-{artist}。我边听边说的：{notes[:180]}。"
             "用你自己的风格给这段听歌收个尾，一句话，不超过 40 字。）")
         await post_chat(("🎵 " + reply[:120]) if reply else "🎵 听完了。")
+    else:
+        await post_chat("🎵 听完了。")
 
 
 def start_listen(track: dict, play_state: dict) -> None:

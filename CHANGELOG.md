@@ -4,6 +4,22 @@
 
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 修复
+
+- 插件入口改为在 `initialize()` 生命周期中启动监听任务，避免 `__init__` 阶段没有运行中事件循环时崩溃。
+- 插件内模块导入兼容 AstrBot 包加载和独立运行两种方式。
+- 状态文件优先保存到 AstrBot 插件数据目录，避免插件升级或重装时丢失。
+- 修复未配置 `identity_secret` 时调用音乐 URL 接口发生 `IndexError` 的问题。
+- 移除插件模式下的 `logging.basicConfig`，避免覆盖 AstrBot 的日志配置。
+- 统一 `gemini_model` 默认值为 `gemini-2.5-flash`，与配置面板一致。
+- 移除代码中硬编码的私有人设、会话 ID 和 provider 默认值，改为与发布版默认配置一致。
+
+### 改进
+
+- 歌曲结束且没有任何听歌笔记时仍会发送收尾消息。
+
 ## [0.1.0] - 2026-09-12
 
 首个公开版本，面向 AstrBot 插件市场发布。

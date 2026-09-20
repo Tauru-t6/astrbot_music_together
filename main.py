@@ -2,26 +2,33 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.star import Star
 
+_BASE = Path(__file__).resolve().parent
+if str(_BASE) not in sys.path:
+    sys.path.insert(0, str(_BASE))
+
 import bot
+
+_KEYS = (
+    "enabled", "server_url", "identity_secret", "room_id", "nickname",
+    "create_if_missing", "gemini_endpoint", "gemini_key", "gemini_model",
+    "proxy", "max_reactions", "segment_seconds", "analyze_lead_seconds",
+    "persona", "astrbot_chat_url", "astrbot_api_key", "astrbot_session",
+    "astrbot_username", "astrbot_provider", "reply_all_chat",
+)
 
 
 def _config_dict(config: AstrBotConfig) -> dict[str, Any]:
     if isinstance(config, Mapping):
-        return dict(config)
-    keys = (
-        "enabled", "server_url", "identity_secret", "room_id", "nickname",
-        "create_if_missing", "gemini_endpoint", "gemini_key", "gemini_model",
-        "proxy", "max_reactions", "segment_seconds", "analyze_lead_seconds",
-        "persona", "astrbot_chat_url", "astrbot_api_key", "astrbot_session",
-        "astrbot_username", "astrbot_provider", "reply_all_chat",
-    )
-    return {key: config.get(key) for key in keys}
+        return {key: config[key] for key in _KEYS if key in config}
+    return {key: config.get(key) for key in _KEYS}
 
 
 class MusicBotPlugin(Star):
@@ -30,7 +37,16 @@ class MusicBotPlugin(Star):
     def __init__(self, context: Any, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
-        bot.apply_config(_config_dict(config))
+        self._task: asyncio.Task | None = None
+
+    async def initialize(self) -> None:
+        bot.apply_config(_config_dict(self.config))
+        try:
+            from astrbot.api.star import StarTools
+            data_dir = StarTools.get_data_dir("astrbot_plugin_music_bot")
+            bot.set_state_path(Path(data_dir) / "state.json")
+        except Exception:
+            pass
         self._task = asyncio.create_task(self._run())
 
     async def _run(self) -> None:
@@ -57,7 +73,3 @@ class MusicBotPlugin(Star):
                 await self._task
             except asyncio.CancelledError:
                 pass
-
-
-def create_plugin(context: Any, config: AstrBotConfig) -> MusicBotPlugin:
-    return MusicBotPlugin(context, config)

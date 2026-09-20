@@ -104,6 +104,8 @@ Music Together Socket.IO -> 读取歌曲状态 -> 下载音频 -> MP3 切片 -> 
 | `persona` | 小听默认人设 | 发送给模型的反应风格提示。 |
 | `proxy` | 空 | 可选 HTTP 代理，用于模型请求和音频下载。 |
 
+只有 MP3 音频能被切片分析。音源是 m4a、flac 等格式，或下载失败时，插件退化为"知识模式"：仅根据歌名、歌手和已有笔记生成反应，且会提示模型不要编造听不到的内容。
+
 ### AstrBot 对话字段
 
 这些字段用于可选的 AstrBot Chat API。`astrbot_api_key` 留空时，插件仍能发送基于 Gemini 的听歌反应，但不会调用 AstrBot 处理聊天和收尾。
@@ -129,7 +131,7 @@ cp config.example.json config.json
 python bot.py
 ```
 
-独立运行时，`config.json` 必须填写 `server_url`、`identity_secret`、`gemini_endpoint` 和 `gemini_key`。状态会写入同目录的 `state.json`，其中可能包含房间重连 token；请限制文件权限并避免提交到 Git。
+独立运行时，`config.json` 必须填写 `server_url`、`identity_secret`、`gemini_endpoint` 和 `gemini_key`。状态会写入同目录的 `state.json`，其中可能包含房间重连 token；请限制文件权限并避免提交到 Git。作为 AstrBot 插件运行时，状态文件保存在 AstrBot 的插件数据目录，不会写入插件目录。
 
 ## 隐私、费用和安全
 
