@@ -74,8 +74,8 @@ GEMINI_KEY = str(CFG.get("gemini_key", ""))
 GEMINI_MODEL = CFG.get("gemini_model", "gemini-2.5-flash")
 PROXY = str(CFG.get("proxy", ""))
 MAX_REACTIONS = int(CFG.get("max_reactions", 4))
-SEGMENT_SECONDS = float(CFG.get("segment_seconds", 45))
-ANALYZE_LEAD_SECONDS = float(CFG.get("analyze_lead_seconds", 20))
+SEGMENT_SECONDS = float(CFG.get("segment_seconds", 30))
+ANALYZE_LEAD_SECONDS = float(CFG.get("analyze_lead_seconds", 25))
 PERSONA = CFG.get(
     "persona",
     "你叫小听。语气简短、口语化，像和用户一起听歌时随口点评。不要编造听不到的内容。",
@@ -132,8 +132,8 @@ def apply_config(config: dict) -> None:
     PROXY = str(CFG.get("proxy", "") or "").strip()
     PROXIES = {"http": PROXY, "https": PROXY} if PROXY else None
     MAX_REACTIONS = max(1, min(int(CFG.get("max_reactions", 4)), 12))
-    SEGMENT_SECONDS = max(10.0, min(float(CFG.get("segment_seconds", 45)), 180.0))
-    ANALYZE_LEAD_SECONDS = max(0.0, min(float(CFG.get("analyze_lead_seconds", 20)), 60.0))
+    SEGMENT_SECONDS = max(10.0, min(float(CFG.get("segment_seconds", 30)), 180.0))
+    ANALYZE_LEAD_SECONDS = max(0.0, min(float(CFG.get("analyze_lead_seconds", 25)), 60.0))
     PERSONA = str(CFG.get("persona", PERSONA) or PERSONA)[:2000]
     ASTRBOT_URL = str(CFG.get("astrbot_chat_url", "http://127.0.0.1:6185/api/v1/chat") or "").strip()
     ASTRBOT_KEY = str(CFG.get("astrbot_api_key", "") or "")
@@ -151,6 +151,39 @@ def gemini_url() -> str:
 # relay Gemini (native generateContent, chrome TLS fingerprint, via mihomo)
 # ---------------------------------------------------------------------------
 
+# Gemini 3.x rejects thinkingBudget (400); older models reject thinkingLevel.
+# Remember which one the endpoint accepts so we only probe once.
+THINKING_STYLE: str | None = None  # None = unknown, "level" or "budget"
+
+
+def parse_model_json(text: str) -> dict | None:
+    """Tolerantly extract the first JSON object from model output.
+
+    Handles Markdown fences, trailing commas, and full-width quotes that
+    Gemini occasionally emits despite response_mime_type=application/json.
+    """
+    m = re.search(r"\{[\s\S]*\}", text)
+    if not m:
+        return None
+    raw = m.group(0)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    fixed = raw.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
+    fixed = re.sub(r",(\s*[}\]])", r"\1", fixed)  # trailing commas
+    try:
+        return json.loads(fixed)
+    except json.JSONDecodeError:
+        return None
+
+
+def _thinking_cfg(style: str | None) -> dict:
+    if style == "level":
+        return {"thinkingLevel": "low"}
+    return {"thinkingBudget": 0}
+
+
 def gemini_generate(parts: list[dict], thinking: bool = True,
                     attempts: int = 3, timeout: int = 120) -> dict | None:
     """Call native generateContent. thinking=False = fast mode (reactions).
@@ -158,14 +191,17 @@ def gemini_generate(parts: list[dict], thinking: bool = True,
     Sync function (callers wrap in to_thread). Retries transient connection
     resets; every attempt is hard-deadlined so a hung call can't stall.
     """
-    gen_cfg: dict = {"response_mime_type": "application/json"}
-    if not thinking:
-        gen_cfg["thinkingConfig"] = {"thinkingBudget": 0}
-    body = {
-        "contents": [{"parts": parts}],
-        "generationConfig": gen_cfg,
-    }
+    global THINKING_STYLE
     for attempt in range(1, attempts + 1):
+        gen_cfg: dict = {"response_mime_type": "application/json"}
+        if not thinking:
+            if THINKING_STYLE is None:
+                THINKING_STYLE = "level"  # Gemini 3.x dialect; older models 400 and we switch
+            gen_cfg["thinkingConfig"] = _thinking_cfg(THINKING_STYLE)
+        body = {
+            "contents": [{"parts": parts}],
+            "generationConfig": gen_cfg,
+        }
         t0 = time.time()
         try:
             r = crequests.post(
@@ -176,6 +212,11 @@ def gemini_generate(parts: list[dict], thinking: bool = True,
                 impersonate="chrome",
                 timeout=timeout,
             )
+            if r.status_code == 400 and not thinking and "thinking" in r.text.lower():
+                # wrong thinking-config dialect for this model — switch and retry
+                THINKING_STYLE = "budget" if THINKING_STYLE != "budget" else "level"
+                log.info("gemini thinking dialect switched to %s", THINKING_STYLE)
+                continue
             if r.status_code != 200:
                 log.warning("gemini http %s: %s", r.status_code, r.text[:200])
                 if r.status_code not in (408, 425, 429) and r.status_code < 500:
@@ -186,9 +227,8 @@ def gemini_generate(parts: list[dict], thinking: bool = True,
                 return None
             parts_out = r.json()["candidates"][0]["content"]["parts"]
             text = "".join(p.get("text", "") for p in parts_out)
-            m = re.search(r"\{[\s\S]*\}", text)
+            result = parse_model_json(text)
             log.info("gemini ok in %.0fs", time.time() - t0)
-            result = json.loads(m.group(0)) if m else None
             if result is None and attempt < attempts:
                 time.sleep(2)
                 continue
@@ -230,8 +270,9 @@ def astrbot_chat(context_text: str, timeout: int = 90) -> str | None:
         "message": context_text,
         "session_id": ASTRBOT_SESSION,
         "username": ASTRBOT_USER,
-        "selected_provider": ASTRBOT_PROVIDER,
     }
+    if ASTRBOT_PROVIDER:
+        body["selected_provider"] = ASTRBOT_PROVIDER
     try:
         r = crequests.post(
             ASTRBOT_URL,
@@ -388,7 +429,10 @@ class ListenSession:
         self.paused = not play_state.get("isPlaying", False)
         self.duration = duration_of(track)
         self.notes: list[str] = []
+        self.pause_replied = False
         self.task: asyncio.Task | None = None
+        self.sync_task: asyncio.Task | None = None
+        self.pause_task: asyncio.Task | None = None
 
     def position(self) -> float:
         if self.paused:
@@ -403,10 +447,27 @@ class ListenSession:
         self.anchor_time = float(play_state.get("currentTime", self.anchor_time))
         self.anchor_ts = float(play_state.get("serverTimestamp", time.time() * 1000))
         self.paused = False
+        self.pause_replied = False
 
     def seek(self, play_state: dict) -> None:
         self.anchor_time = float(play_state.get("currentTime", 0))
         self.anchor_ts = float(play_state.get("serverTimestamp", time.time() * 1000))
+
+    def sync(self, play_state: dict) -> None:
+        """Soft-correct the playback anchor from the server's authority clock.
+
+        The server broadcasts sync frames (~10s). Without this, client clock
+        skew and missed pause/seek events drift the reaction schedule.
+        """
+        ct = play_state.get("currentTime")
+        if ct is None:
+            return
+        server_pos = float(ct)
+        drift = abs(server_pos - self.position())
+        if drift > 2.0:
+            log.info("clock sync: drift %.1fs, re-anchoring", drift)
+            self.anchor_time = server_pos
+            self.anchor_ts = float(play_state.get("serverTimestamp", time.time() * 1000))
 
 
 SESSION: ListenSession | None = None
@@ -440,6 +501,38 @@ async def wait_until(session: ListenSession, target: float) -> bool:
         await asyncio.sleep(0.5)
 
 
+async def sync_loop(session: ListenSession) -> None:
+    """Ask the server for its authority playback clock every ~10s."""
+    try:
+        while sio.connected:
+            await asyncio.sleep(10)
+            await sio.emit("player:sync_request", {})
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log.warning("sync loop stopped: %s", exc)
+
+
+async def pause_reaction_loop(session: ListenSession) -> None:
+    """Say something once when the user pauses mid-song (deduped per pause)."""
+    try:
+        while True:
+            await asyncio.sleep(1.5)
+            if not session.paused or session.pause_replied:
+                continue
+            session.pause_replied = True
+            pos = int(session.anchor_time)
+            title = session.track.get("title", "")
+            reply = await asyncio.to_thread(
+                gemini_text,
+                f"{PERSONA}\n你们正在一起听《{title}》，用户在第 {pos} 秒按了暂停。"
+                "随口说一句，不超过 20 字，只输出这句话本身。")
+            if reply:
+                await post_chat(reply[:60])
+    except asyncio.CancelledError:
+        raise
+
+
 async def listen_along(track: dict) -> None:
     session = SESSION
     if not session:
@@ -459,6 +552,9 @@ async def listen_along(track: dict) -> None:
         log.info("audio is %s; cannot split, knowledge mode", mime)
 
     await post_chat(f"♪ 《{title}》，一起听。")
+    session.task = asyncio.current_task()
+    session.sync_task = asyncio.create_task(sync_loop(session))
+    session.pause_task = asyncio.create_task(pause_reaction_loop(session))
 
     earlier: list[str] = []
     for seg_start, seg_bytes in segments:
@@ -547,8 +643,10 @@ def start_listen(track: dict, play_state: dict) -> None:
 
 def stop_listen() -> None:
     global SESSION
-    if SESSION and SESSION.task:
-        SESSION.task.cancel()
+    if SESSION:
+        for task in (SESSION.task, SESSION.sync_task, SESSION.pause_task):
+            if task:
+                task.cancel()
     SESSION = None
 
 
@@ -563,6 +661,7 @@ async def shutdown() -> None:
 # ---------------------------------------------------------------------------
 
 ROOM_ID: str = ""
+LAST_EMPTY_SINCE: float | None = None
 
 
 @sio.event
@@ -582,6 +681,23 @@ async def connect() -> None:
 @sio.event
 async def disconnect() -> None:
     log.warning("disconnected; will retry")
+
+
+async def leave_empty_room() -> None:
+    """Leave a room with no real users so the bot doesn't squat alone."""
+    global ROOM_ID, LAST_EMPTY_SINCE
+    log.info("room has no real users for 30s; leaving")
+    stop_listen()
+    try:
+        await sio.emit("room:leave", {})
+    except Exception as exc:
+        log.warning("room leave failed: %s", exc)
+    ROOM_ID = ""
+    STATE.pop("room_id", None)
+    save_json(STATE_PATH, STATE)
+    LAST_EMPTY_SINCE = time.time()
+    await asyncio.sleep(30)  # cooldown before re-discovering
+    await sio.emit("room:list")
 
 
 @sio.on("room:created")
@@ -604,23 +720,37 @@ async def on_state(room: dict) -> None:
     ROOM_ID = room.get("id", ROOM_ID)
     STATE["room_id"] = ROOM_ID
     save_json(STATE_PATH, STATE)
-    log.info("in room %s (%s), users=%s", ROOM_ID, room.get("name"), len(room.get("users") or []))
+    users = room.get("users") or []
+    real_users = [u for u in users if (u.get("nickname") if isinstance(u, dict) else u) != NICKNAME]
+    log.info("in room %s (%s), users=%s", ROOM_ID, room.get("name"), len(users))
+    if not ROOM_ID_CFG and not real_users:
+        asyncio.create_task(_leave_if_still_empty(ROOM_ID))
     current = room.get("currentTrack")
     play = room.get("playState") or {}
     if current and play:
         start_listen(current, play)
 
 
+async def _leave_if_still_empty(room_id: str) -> None:
+    await asyncio.sleep(30)
+    if ROOM_ID == room_id:
+        await leave_empty_room()
+
+
 @sio.on("room:list_update")
 async def on_rooms(rooms: list) -> None:
     if ROOM_ID or ROOM_ID_CFG:
         return
-    if rooms:
-        target = rooms[0]["id"]
+    if LAST_EMPTY_SINCE and time.time() - LAST_EMPTY_SINCE < 60:
+        return  # don't immediately re-create after leaving an empty room
+    occupied = [r for r in rooms
+                if isinstance(r, dict) and int(r.get("userCount") or 0) >= 1]
+    if occupied:
+        target = occupied[0]["id"]
         log.info("joining existing room %s", target)
         await sio.emit("room:join", {"roomId": target, "nickname": NICKNAME})
     elif CFG.get("create_if_missing", True):
-        log.info("no rooms; creating one")
+        log.info("no occupied rooms; creating one")
         await sio.emit("room:create", {"nickname": NICKNAME, "roomName": "一起听歌"})
 
 
@@ -656,6 +786,12 @@ async def on_resume(data: dict) -> None:
 async def on_seek(data: dict) -> None:
     if SESSION:
         SESSION.seek(data or {})
+
+
+@sio.on("player:sync")
+async def on_sync(data: dict) -> None:
+    if SESSION:
+        SESSION.sync(data or {})
 
 
 @sio.on("player:next")
