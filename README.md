@@ -19,6 +19,7 @@
 - 音频无法下载或不是可切片的 MP3 时，退化为根据歌曲标题和歌手生成反应。
 - 对房间聊天进行节流，避免机器人快速重复回复。
 - 可选使用 AstrBot Chat API 处理聊天回复和歌曲结束语。
+- 房间聊天注入 AstrBot 原生管道（webchat 或 aiocqhttp 会话桶），记忆插件可见。
 - 插件停止时取消分析任务并断开 Socket.IO 连接。
 - 保留 `bot.py` 独立入口，兼容已有的 systemd 部署。
 
@@ -111,16 +112,16 @@ Music Together Socket.IO -> 读取歌曲状态 -> 下载音频 -> MP3 切片 -> 
 
 ### AstrBot 对话字段
 
-这些字段用于可选的 AstrBot Chat API。`astrbot_api_key` 留空时，插件仍能发送基于 Gemini 的听歌反应，但不会调用 AstrBot 处理聊天和收尾。
+房间聊天会注入 AstrBot 原生管道（不是 HTTP 开放 API），因此回复和记忆会落在真实的会话桶里，memory 类插件可以正常看到。注入是会话内的直接调用，不需要 API key。
 
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
-| `astrbot_chat_url` | `http://127.0.0.1:6185/api/v1/chat` | AstrBot Chat API 地址。 |
-| `astrbot_api_key` | 空 | AstrBot Chat API 的 Bearer token。 |
-| `astrbot_session` | `music-bot` | AstrBot 会话 ID。 |
-| `astrbot_username` | `music-bot` | 请求中使用的用户名。 |
-| `astrbot_provider` | 空 | 可选的 provider 名称。 |
+| `chat_session_id` | `music-room` | 房间聊天注入的会话桶。填 QQ 会话字符串（如 `Tauru:FriendMessage:1125961157`）时注入 aiocqhttp 的 QQ 桶，记忆进入原号主会话；其他值注入 webchat 桶 `webchat!{chat_user}!{值}`。 |
+| `chat_platform_id` | `Tauru` | `chat_session_id` 为 QQ 会话时使用的平台适配器 ID。QQ 适配器离线时跳过注入，不影响弹幕。 |
+| `chat_user` | `music-room` | webchat 桶的注入用户名（会话创建者）。 |
 | `reply_all_chat` | `true` | 是否回应房间里的所有非系统聊天。关闭后，仅在消息包含机器人昵称或 `@昵称` 时回应。 |
+
+歌曲收尾也走同一条注入管道，以人设风格发一句结束语；注入不可用时不发收尾（弹幕反应不受影响）。
 
 仓库中的 [config.example.json](config.example.json) 只包含占位值，可以作为字段参考。AstrBot 安装时直接在 WebUI 配置，不需要创建这个文件。
 
@@ -138,11 +139,11 @@ python bot.py
 
 ## 隐私、费用和安全
 
-启用音频分析后，插件会把当前歌曲的音频片段发送到 `gemini_endpoint`。启用房间聊天回复后，聊天内容会发送到 Gemini 或 AstrBot Chat API。第三方 endpoint 可能记录请求内容并产生模型费用，请使用自己信任的服务。
+启用音频分析后，插件会把当前歌曲的音频片段发送到 `gemini_endpoint`。房间聊天内容会发送给 AstrBot 当前会话使用的模型 provider。第三方 endpoint 可能记录请求内容并产生模型费用，请使用自己信任的服务。
 
 插件不会把 API key 写入日志，但日志会记录歌曲标题、歌手、房间事件和生成的反应。多人房间使用时，应提前告知参与者音频和聊天可能会被发送到外部模型服务。
 
-建议使用 HTTPS 或受信任的内网地址，为每个服务使用独立且可撤销的 key；如果密钥曾被提交或公开，立即撤销并重新生成。不需要聊天回复时，保持 `astrbot_api_key` 为空。
+建议使用 HTTPS 或受信任的内网地址，为每个服务使用独立且可撤销的 key；如果密钥曾被提交或公开，立即撤销并重新生成。
 
 ## 故障排查
 
@@ -160,7 +161,7 @@ python bot.py
 
 ### 只能听歌，不能回复聊天
 
-`astrbot_api_key` 留空时不会走 AstrBot Chat API。填写有效 key 后重启插件，再检查 `astrbot_chat_url`、session ID 和 provider 名称。
+聊天回复通过 AstrBot 原生管道注入，不依赖 API key。检查 AstrBot 的 webchat 平台是否在运行；如果 `chat_session_id` 填的是 QQ 会话，确认对应的 aiocqhttp 平台适配器在线且 `chat_platform_id` 正确。注入不可用时日志会出现 `chat injection failed` 或 `platform ... not available`，此时回退到 Gemini 文本回复。
 
 ### 模型返回格式错误
 

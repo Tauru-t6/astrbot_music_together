@@ -83,11 +83,20 @@ PERSONA = CFG.get(
 
 PROXIES = {"http": PROXY, "https": PROXY} if PROXY else None
 
-ASTRBOT_URL = str(CFG.get("astrbot_chat_url", "http://127.0.0.1:6185/api/v1/chat"))
-ASTRBOT_KEY = str(CFG.get("astrbot_api_key", ""))
-ASTRBOT_SESSION = str(CFG.get("astrbot_session", "music-bot"))
-ASTRBOT_USER = str(CFG.get("astrbot_username", "music-bot"))
-ASTRBOT_PROVIDER = str(CFG.get("astrbot_provider", ""))
+# Where room chat gets injected. Two shapes:
+#   QQ session  "Tauru:FriendMessage:1125961157" → aiocqhttp platform bucket
+#   anything else (e.g. "music-room")           → webchat adapter bucket
+CHAT_SESSION_ID = str(CFG.get("chat_session_id", "music-room"))
+CHAT_USER = str(CFG.get("chat_user", "music-room"))
+CHAT_PLATFORM_ID = str(CFG.get("chat_platform_id", "Tauru"))
+
+_CONTEXT = None
+
+
+def bind_context(context) -> None:
+    """Capture the running AstrBot Context for native event injection."""
+    global _CONTEXT
+    _CONTEXT = context
 
 
 def issue_identity_token(secret: str, uid: str = "music-bot-01") -> str:
@@ -118,7 +127,7 @@ def apply_config(config: dict) -> None:
     global CFG, SERVER, NICKNAME, ROOM_ID_CFG, IDENTITY_SECRET
     global GEMINI_ENDPOINT, GEMINI_KEY, GEMINI_MODEL, PROXY, PROXIES
     global MAX_REACTIONS, SEGMENT_SECONDS, ANALYZE_LEAD_SECONDS, PERSONA
-    global ASTRBOT_URL, ASTRBOT_KEY, ASTRBOT_SESSION, ASTRBOT_USER, ASTRBOT_PROVIDER
+    global CHAT_SESSION_ID, CHAT_USER, CHAT_PLATFORM_ID
     global REPLY_ALL_CHAT, IDENTITY_COOKIE
 
     CFG = dict(config or {})
@@ -135,11 +144,9 @@ def apply_config(config: dict) -> None:
     SEGMENT_SECONDS = max(10.0, min(float(CFG.get("segment_seconds", 30)), 180.0))
     ANALYZE_LEAD_SECONDS = max(0.0, min(float(CFG.get("analyze_lead_seconds", 25)), 60.0))
     PERSONA = str(CFG.get("persona", PERSONA) or PERSONA)[:2000]
-    ASTRBOT_URL = str(CFG.get("astrbot_chat_url", "http://127.0.0.1:6185/api/v1/chat") or "").strip()
-    ASTRBOT_KEY = str(CFG.get("astrbot_api_key", "") or "")
-    ASTRBOT_SESSION = str(CFG.get("astrbot_session", "music-bot") or "music-bot")
-    ASTRBOT_USER = str(CFG.get("astrbot_username", "music-bot") or "music-bot")
-    ASTRBOT_PROVIDER = str(CFG.get("astrbot_provider", "") or "")
+    CHAT_SESSION_ID = str(CFG.get("chat_session_id", "music-room") or "music-room")
+    CHAT_USER = str(CFG.get("chat_user", "music-room") or "music-room")
+    CHAT_PLATFORM_ID = str(CFG.get("chat_platform_id", "Tauru") or "Tauru")
     REPLY_ALL_CHAT = bool(CFG.get("reply_all_chat", True))
     IDENTITY_COOKIE = "mt_identity=" + issue_identity_token(IDENTITY_SECRET) if IDENTITY_SECRET else ""
 
@@ -184,6 +191,16 @@ def _thinking_cfg(style: str | None) -> dict:
     return {"thinkingBudget": 0}
 
 
+def gemini_proxies() -> dict | None:
+    """Bypass the proxy for localhost endpoints and the kdysite relay —
+    ~1MB audio uploads through a proxy time out, and kdysite is directly
+    reachable (it sits behind Cloudflare, hence the chrome fingerprint)."""
+    ep = GEMINI_ENDPOINT.lower()
+    if "kdysite" in ep or "127.0.0.1" in ep or "localhost" in ep:
+        return None
+    return PROXIES
+
+
 def gemini_generate(parts: list[dict], thinking: bool = True,
                     attempts: int = 3, timeout: int = 120) -> dict | None:
     """Call native generateContent. thinking=False = fast mode (reactions).
@@ -208,7 +225,7 @@ def gemini_generate(parts: list[dict], thinking: bool = True,
                 gemini_url(),
                 json=body,
                 headers={"x-goog-api-key": GEMINI_KEY},
-                proxies=PROXIES,
+                proxies=gemini_proxies(),
                 impersonate="chrome",
                 timeout=timeout,
             )
@@ -248,7 +265,7 @@ def gemini_text(prompt: str, timeout: int = 60) -> str | None:
             gemini_url(),
             json=body,
             headers={"x-goog-api-key": GEMINI_KEY},
-            proxies=PROXIES,
+            proxies=gemini_proxies(),
             impersonate="chrome",
             timeout=timeout,
         )
@@ -262,42 +279,180 @@ def gemini_text(prompt: str, timeout: int = 60) -> str | None:
         return None
 
 
-def astrbot_chat(context_text: str, timeout: int = 90) -> str | None:
-    """Ask AstrBot (full pipeline: Tauru persona, memory, companion plugins)."""
-    if not ASTRBOT_KEY:
-        return None
-    body = {
-        "message": context_text,
-        "session_id": ASTRBOT_SESSION,
-        "username": ASTRBOT_USER,
-    }
-    if ASTRBOT_PROVIDER:
-        body["selected_provider"] = ASTRBOT_PROVIDER
+# ---------------------------------------------------------------------------
+# chat injection through AstrBot's native pipeline
+# ---------------------------------------------------------------------------
+#
+# Room chat is wrapped as a platform event and committed to the pipeline so
+# replies and memories land in a real session bucket. CHAT_SESSION_ID picks
+# the bucket:
+#   QQ form  ("Tauru:FriendMessage:1125961157") → aiocqhttp platform, the
+#     original session string is used as-is so memories land in the owner's
+#     real conversation bucket;
+#   otherwise → webchat adapter, session webchat!{CHAT_USER}!{it}.
+#
+# Reply capture differs by platform:
+#   webchat: reply flows into webchat_queue_mgr back-queue keyed by the
+#     injected message_id (WebChatMessageEvent.send writes there);
+#   aiocqhttp (QQ): the adapter delivers the reply to QQ directly, so we
+#     capture it by wrapping the event class's send path once.
+
+
+async def inject_room_chat(user: str, content: str) -> list[str]:
+    """Inject one room chat message into the pipeline; collect the reply."""
+    context = _CONTEXT
+    if context is None:
+        return []
     try:
-        r = crequests.post(
-            ASTRBOT_URL,
-            json=body,
-            headers={"Authorization": "Bearer " + ASTRBOT_KEY},
-            timeout=timeout,
-        )
-        if r.status_code != 200:
-            log.warning("astrbot chat http %s", r.status_code)
-            return None
-        texts = []
-        for line in r.text.splitlines():
-            if not line.startswith("data: "):
-                continue
-            try:
-                event = json.loads(line[6:])
-            except json.JSONDecodeError:
-                continue
-            if event.get("type") == "plain":
-                texts.append(str(event.get("data", "")))
-        reply = "".join(texts).strip()
-        return reply or None
+        from astrbot.core.message.message_event_result import MessageChain
+        from astrbot.core.platform import AstrBotMessage, MessageMember, MessageType
+        from astrbot.api.message_components import Plain
+
+        message_id = f"mt_{int(time.time() * 1000)}_{id(content) % 10000}"
+        use_qq = "FriendMessage" in CHAT_SESSION_ID and "webchat" not in CHAT_SESSION_ID
+
+        reply_texts: list[str] = []
+        if use_qq:
+            platform = context.get_platform_inst(CHAT_PLATFORM_ID)
+            if platform is None:
+                log.warning("platform %s not available (offline?); skipping chat injection",
+                            CHAT_PLATFORM_ID)
+                return []
+            session_id = CHAT_SESSION_ID.split(":")[-1]
+            self_id = str(getattr(platform, "_self_id", "") or "")
+            capture = _install_qq_send_capture()
+        else:
+            from astrbot.core.platform.sources.webchat.webchat_queue_mgr import (
+                webchat_queue_mgr,
+            )
+            platform = context.get_platform_inst("webchat")
+            if platform is None:
+                log.warning("webchat platform not found; skipping chat injection")
+                return []
+            session_id = f"webchat!{CHAT_USER}!{CHAT_SESSION_ID}"
+            self_id = "webchat"
+            reply_queue = webchat_queue_mgr.get_or_create_back_queue(
+                message_id, CHAT_SESSION_ID
+            )
+
+        try:
+            abm = AstrBotMessage()
+            abm.self_id = self_id
+            abm.sender = MessageMember(
+                session_id if use_qq else CHAT_USER, user or "room_user"
+            )
+            abm.type = MessageType.FRIEND_MESSAGE
+            abm.session_id = session_id
+            abm.message_id = message_id
+            abm.message = MessageChain(chain=[Plain(content)])
+            abm.message_str = content
+            abm.raw_message = ("music-bot", CHAT_USER, CHAT_SESSION_ID)
+            abm.timestamp = int(time.time())
+
+            if use_qq and capture is not None:
+                capture.queue = reply_texts
+
+            await platform.handle_msg(abm)
+            log.info("injected room chat: %s: %s", user, content[:60])
+
+            if use_qq:
+                deadline = time.time() + 30.0
+                while time.time() < deadline and not reply_texts:
+                    await asyncio.sleep(1.0)
+                return reply_texts
+            replies: list[str] = []
+            deadline = time.time() + 30.0
+            while time.time() < deadline:
+                try:
+                    item = await asyncio.wait_for(reply_queue.get(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    if replies:
+                        break
+                    continue
+                data = item if isinstance(item, dict) else {}
+                if data.get("type") == "plain":
+                    piece = str(data.get("data", ""))
+                    if piece.strip():
+                        replies.append(piece)
+                elif data.get("type") == "end":
+                    break
+            return replies
+        finally:
+            if not use_qq:
+                from astrbot.core.platform.sources.webchat.webchat_queue_mgr import (
+                    webchat_queue_mgr,
+                )
+                webchat_queue_mgr.remove_back_queue(message_id)
+            if use_qq and capture is not None:
+                capture.queue = None
     except Exception as exc:
-        log.warning("astrbot chat failed: %s", exc)
+        log.warning("chat injection failed: %s", exc)
+        return []
+
+
+class _QqSendCapture:
+    """Shared sink for QQ replies captured from the adapter send path."""
+
+    def __init__(self) -> None:
+        self.queue: list[str] | None = None
+        self.installed = False
+
+
+_QQ_CAPTURE = _QqSendCapture()
+
+
+def _install_qq_send_capture() -> _QqSendCapture | None:
+    """Wrap AiocqhttpMessageEvent.send once to capture outgoing replies.
+
+    Only intercepts while an injection is waiting (capture.queue is not
+    None), so normal QQ traffic is untouched.
+    """
+    if _QQ_CAPTURE.installed:
+        return _QQ_CAPTURE
+    try:
+        from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+            AiocqhttpMessageEvent,
+        )
+
+        original_send = AiocqhttpMessageEvent.send
+
+        async def captured_send(self, message):
+            if _QQ_CAPTURE.queue is not None:
+                for comp in getattr(message, "chain", []) or []:
+                    text = getattr(comp, "text", "") or ""
+                    if text.strip():
+                        _QQ_CAPTURE.queue.append(text)
+            return await original_send(self, message)
+
+        AiocqhttpMessageEvent.send = captured_send  # type: ignore[method-assign]
+        _QQ_CAPTURE.installed = True
+        log.info("QQ send capture installed")
+        return _QQ_CAPTURE
+    except Exception as exc:
+        log.warning("QQ send capture unavailable: %s", exc)
         return None
+
+
+async def wait_for_platform(timeout: float = 20.0) -> bool:
+    """Wait until AstrBot finishes platform startup before injecting."""
+    context = _CONTEXT
+    if context is None:
+        return False
+    end = time.time() + timeout
+    while time.time() < end:
+        if context.get_platform_inst("webchat") is not None:
+            return True
+        await asyncio.sleep(1)
+    return False
+
+
+async def astrbot_reply(context_text: str) -> str | None:
+    """Ask AstrBot's full pipeline (persona, memory, companion plugins)."""
+    if _CONTEXT is None:
+        return None
+    replies = await inject_room_chat(CHAT_USER, context_text)
+    reply = "".join(replies).strip()
+    return reply or None
 
 # ---------------------------------------------------------------------------
 # music-together REST helpers (identity cookie auth)
@@ -620,13 +775,12 @@ async def listen_along(track: dict) -> None:
             await post_chat(r["text"])
             session.notes.append(f"{int(r['at'])}s {r['text']}")
 
-    # wait for natural end, then let AstrBot close it out in Tauru's voice
+    # wait for natural end, then let AstrBot close it out in persona's voice
     if session.duration:
         await wait_until(session, session.duration - 1.0)
     if session.notes:
         notes = "；".join(session.notes[-4:])
-        reply = await asyncio.to_thread(
-            astrbot_chat,
+        reply = await astrbot_reply(
             f"（场景：我们刚一起听完《{title}》-{artist}。我边听边说的：{notes[:180]}。"
             "用你自己的风格给这段听歌收个尾，一句话，不超过 40 字。）")
         await post_chat(("🎵 " + reply[:120]) if reply else "🎵 听完了。")
@@ -825,12 +979,13 @@ async def on_chat(message: dict) -> None:
     title = SESSION.track.get("title", "")
     artist = "/".join(SESSION.track.get("artist") or [])
     pos = int(SESSION.position())
-    reply = await asyncio.to_thread(
-        astrbot_chat,
+    replies = await inject_room_chat(
+        user,
         f"（场景：我们正在房间一起听《{title}》-{artist}，播放到第 {pos} 秒。"
-        f"用户刚刚在房间聊天里对你说：“{clean[:100]}”。"
+        f"房间用户 {user} 说：“{clean[:100]}”。"
         "结合此刻的听感自然回应，口语化，不要超过 50 字。）",
     )
+    reply = "".join(replies).strip()
     if not reply:
         reply = await asyncio.to_thread(
             gemini_text,
@@ -848,6 +1003,8 @@ async def main() -> None:
         raise SystemExit("identity_secret missing in music-bot configuration")
     if not GEMINI_ENDPOINT or not GEMINI_KEY:
         raise SystemExit("gemini_endpoint and gemini_key are required")
+    if _CONTEXT is not None:
+        await wait_for_platform()  # let AstrBot finish platform startup
     while not sio.connected:
         try:
             await sio.connect(

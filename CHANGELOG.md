@@ -4,7 +4,12 @@
 
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [Unreleased] - 0.2.0
+
+### 变更（不兼容）
+
+- **房间聊天与歌曲收尾改为注入 AstrBot 原生管道**（webchat / aiocqhttp 适配器），不再走 HTTP 开放 API：注入消息落在真实会话桶里，memory 类插件可正常读写，也不再需要 API key。相应移除 `astrbot_chat_url` / `astrbot_api_key` / `astrbot_session` / `astrbot_username` / `astrbot_provider` 五个配置项，新增 `chat_session_id` / `chat_platform_id` / `chat_user`。
+- QQ 桶注入：`chat_session_id` 填 QQ 会话字符串（如 `Tauru:FriendMessage:1125961157`）时经 aiocqhttp 适配器注入原号主会话；回复通过临时包装发送路径捕获，仅注入期间生效，不影响正常 QQ 流量。平台离线时跳过注入不报错。
 
 ### 新增
 
@@ -21,10 +26,10 @@
 - 移除插件模式下的 `logging.basicConfig`，避免覆盖 AstrBot 的日志配置。
 - 统一 `gemini_model` 默认值为 `gemini-2.5-flash`，与配置面板一致。
 - 移除代码中硬编码的私有人设、会话 ID 和 provider 默认值，改为与发布版默认配置一致。
-- `astrbot_provider` 留空时不再向 Chat API 发送 `selected_provider`，跟随 AstrBot 会话默认模型（之前硬编码默认值的 provider 已不可用，会 400）。
 - 分析节奏默认值调优为 30 秒片段 + 提前 25 秒预分析（线上调好的值）。
 - Gemini 思考配置按模型方言自适应（Gemini 3 系用 `thinkingLevel`，旧模型用 `thinkingBudget`)，400 时自动切换并记忆。
 - 模型输出 JSON 解析增加容错：Markdown 包裹、尾逗号、全角引号。
+- Gemini 请求对 kdysite 中转和 localhost 端点自动直连绕开代理（1MB 音频段经代理上传会超时）。
 - 歌曲结束且没有任何听歌笔记时仍会发送收尾消息。
 
 ## [0.1.0] - 2026-09-12

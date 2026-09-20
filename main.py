@@ -1,4 +1,11 @@
-"""AstrBot entrypoint for the Music Together listening companion."""
+"""AstrBot entrypoint for the Music Together listening companion.
+
+Room chat is injected into AstrBot's native pipeline (webchat adapter, or
+aiocqhttp for a QQ session bucket) so conversations and memories land in a
+real session bucket. Reaction danmaku (♪, segment comments, pause acks,
+song closers) goes straight back over the socket and is never recorded as
+conversation.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -8,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.star import Star
+from astrbot.api.star import Context, Star, register
 
 _BASE = Path(__file__).resolve().parent
 if str(_BASE) not in sys.path:
@@ -20,8 +27,8 @@ _KEYS = (
     "enabled", "server_url", "identity_secret", "room_id", "nickname",
     "create_if_missing", "gemini_endpoint", "gemini_key", "gemini_model",
     "proxy", "max_reactions", "segment_seconds", "analyze_lead_seconds",
-    "persona", "astrbot_chat_url", "astrbot_api_key", "astrbot_session",
-    "astrbot_username", "astrbot_provider", "reply_all_chat",
+    "persona", "chat_session_id", "chat_platform_id", "chat_user",
+    "reply_all_chat",
 )
 
 
@@ -31,16 +38,18 @@ def _config_dict(config: AstrBotConfig) -> dict[str, Any]:
     return {key: config.get(key) for key in _KEYS}
 
 
+@register("astrbot_plugin_music_bot", "Tauru-t6", "Music Together Companion", "0.2.0")
 class MusicBotPlugin(Star):
     """Own the listener task from AstrBot's plugin lifecycle."""
 
-    def __init__(self, context: Any, config: AstrBotConfig):
+    def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
         self._task: asyncio.Task | None = None
 
     async def initialize(self) -> None:
         bot.apply_config(_config_dict(self.config))
+        bot.bind_context(self.context)
         try:
             from astrbot.api.star import StarTools
             data_dir = StarTools.get_data_dir("astrbot_plugin_music_bot")
