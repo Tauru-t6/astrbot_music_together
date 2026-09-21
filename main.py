@@ -38,7 +38,7 @@ def _config_dict(config: AstrBotConfig) -> dict[str, Any]:
     return {key: config.get(key) for key in _KEYS}
 
 
-@register("astrbot_plugin_music_bot", "Tauru-t6", "Music Together Companion", "0.2.2")
+@register("astrbot_plugin_music_bot", "Tauru-t6", "Music Together Companion", "0.2.3")
 class MusicBotPlugin(Star):
     """Own the listener task from AstrBot's plugin lifecycle."""
 

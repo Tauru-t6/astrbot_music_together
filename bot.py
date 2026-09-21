@@ -445,15 +445,6 @@ async def wait_for_platform(timeout: float = 20.0) -> bool:
         await asyncio.sleep(1)
     return False
 
-
-async def astrbot_reply(context_text: str) -> str | None:
-    """Ask AstrBot's full pipeline (persona, memory, companion plugins)."""
-    if _CONTEXT is None:
-        return None
-    replies = await inject_room_chat(CHAT_USER, context_text)
-    reply = "".join(replies).strip()
-    return reply or None
-
 # ---------------------------------------------------------------------------
 # music-together REST helpers (identity cookie auth)
 # ---------------------------------------------------------------------------
@@ -775,17 +766,17 @@ async def listen_along(track: dict) -> None:
             await post_chat(r["text"])
             session.notes.append(f"{int(r['at'])}s {r['text']}")
 
-    # wait for natural end, then let AstrBot close it out in persona's voice
+    # wait for natural end, then record the wrap-up into the AstrBot
+    # conversation bucket (fire-and-forget; danmaku stays socket-only)
     if session.duration:
         await wait_until(session, session.duration - 1.0)
     if session.notes:
         notes = "；".join(session.notes[-4:])
-        reply = await astrbot_reply(
-            f"（场景：我们刚一起听完《{title}》-{artist}。我边听边说的：{notes[:180]}。"
-            "用你自己的风格给这段听歌收个尾，一句话，不超过 40 字。）")
-        await post_chat(("🎵 " + reply[:120]) if reply else "🎵 听完了。")
-    else:
-        await post_chat("🎵 听完了。")
+        asyncio.create_task(inject_room_chat(
+            CHAT_USER,
+            f"我们刚一起听完《{title}》-{artist}。我边听边说的：{notes[:180]}。"
+            "用你自己的风格给这段听歌收个尾，一句话，不超过 40 字。"))
+    await post_chat("🎵 听完了。")
 
 
 def start_listen(track: dict, play_state: dict) -> None:
