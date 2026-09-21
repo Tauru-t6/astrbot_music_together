@@ -1,5 +1,12 @@
 # 更新日志
 
+## [0.2.2] - 2026-09-21
+
+### 修复
+
+- 上架合规：`bot.py` 日志统一使用 `astrbot.api.logger`（仅独立运行时回退标准 logging）。
+- `download_audio` 中的同步 REST 请求改为 `asyncio.to_thread`，不再阻塞 AstrBot 事件循环。
+
 ## [0.2.1] - 2026-09-21
 
 ### 修复
