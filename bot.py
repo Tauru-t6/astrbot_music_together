@@ -13,7 +13,6 @@ import base64
 import hashlib
 import hmac
 import json
-import logging
 import os
 import re
 import time
@@ -28,12 +27,13 @@ try:
 except ImportError:
     from audio_split import split_mp3_seconds
 
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
-log = logging.getLogger("music-bot")
+try:
+    from astrbot.api import logger as log
+except ImportError:  # standalone mode (python bot.py)
+    import logging
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
+    log = logging.getLogger("music-bot")
 
 BASE = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("MUSIC_BOT_CONFIG", BASE / "config.json"))
@@ -491,7 +491,7 @@ async def download_audio(track: dict) -> tuple[bytes | None, str]:
     url = track.get("streamUrl")
     source = track.get("source", "netease")
     if not url:
-        data = rest_get("/api/music/url", {
+        data = await asyncio.to_thread(rest_get, "/api/music/url", {
             "source": source,
             "urlId": track.get("urlId"),
             "bitrate": 192,
