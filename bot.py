@@ -847,10 +847,7 @@ async def leave_empty_room() -> None:
     except Exception as exc:
         log.warning("room leave failed: %s", exc)
     ROOM_ID = ""
-    STATE.pop("room_id", None)
-    save_json(STATE_PATH, STATE)
     LAST_EMPTY_SINCE = time.time()
-    await asyncio.sleep(30)  # cooldown before re-discovering
     await sio.emit("room:list")
 
 
@@ -859,6 +856,19 @@ async def on_created(data: dict) -> None:
     STATE["room_id"] = data["roomId"]
     save_json(STATE_PATH, STATE)
     log.info("room created: %s", data["roomId"])
+
+
+@sio.on("room:deleted")
+async def on_deleted(data: dict) -> None:
+    """The server deleted our saved room (empty grace period expired)."""
+    global ROOM_ID
+    if data and data.get("roomId") in (ROOM_ID, STATE.get("room_id")):
+        ROOM_ID = ""
+        STATE.pop("room_id", None)
+        STATE.pop("rejoin_token", None)
+        save_json(STATE_PATH, STATE)
+        log.info("saved room was deleted by server; will re-discover")
+        await sio.emit("room:list")
 
 
 @sio.on("room:rejoin_token")
@@ -878,7 +888,12 @@ async def on_state(room: dict) -> None:
     real_users = [u for u in users if (u.get("nickname") if isinstance(u, dict) else u) != NICKNAME]
     log.info("in room %s (%s), users=%s", ROOM_ID, room.get("name"), len(users))
     if not ROOM_ID_CFG and not real_users:
-        asyncio.create_task(_leave_if_still_empty(ROOM_ID))
+        if STATE.get("room_id") == ROOM_ID:
+            # we created / rejoined this room ourselves — stay and wait for
+            # humans instead of churning a create/leave loop
+            log.info("room empty; staying put and waiting for humans")
+        else:
+            asyncio.create_task(_leave_if_still_empty(ROOM_ID))
     current = room.get("currentTrack")
     play = room.get("playState") or {}
     if current and play:
@@ -893,17 +908,21 @@ async def _leave_if_still_empty(room_id: str) -> None:
 
 @sio.on("room:list_update")
 async def on_rooms(rooms: list) -> None:
-    if ROOM_ID or ROOM_ID_CFG:
+    if ROOM_ID_CFG:
         return
     if LAST_EMPTY_SINCE and time.time() - LAST_EMPTY_SINCE < 60:
         return  # don't immediately re-create after leaving an empty room
     occupied = [r for r in rooms
                 if isinstance(r, dict) and int(r.get("userCount") or 0) >= 1]
-    if occupied:
+    # Prefer a room with humans over the empty one we created and saved —
+    # the user will open their own room, not the bot's.
+    if occupied and (not ROOM_ID or occupied[0]["id"] != ROOM_ID):
+        if ROOM_ID:
+            await sio.emit("room:leave", {})
         target = occupied[0]["id"]
-        log.info("joining existing room %s", target)
+        log.info("joining occupied room %s", target)
         await sio.emit("room:join", {"roomId": target, "nickname": NICKNAME})
-    elif CFG.get("create_if_missing", True):
+    elif not ROOM_ID and CFG.get("create_if_missing", True):
         log.info("no occupied rooms; creating one")
         await sio.emit("room:create", {"nickname": NICKNAME, "roomName": "一起听歌"})
 
@@ -996,6 +1015,18 @@ async def on_chat(message: dict) -> None:
 
 # ---------------------------------------------------------------------------
 
+async def discovery_loop() -> None:
+    """Re-check the room list every 30s while squatting alone in our own
+    room, so we notice when the user opens their own room."""
+    while True:
+        await asyncio.sleep(30)
+        if not sio.connected or ROOM_ID_CFG:
+            continue
+        if SESSION is not None:
+            continue  # actively listening — don't disturb playback
+        await sio.emit("room:list")
+
+
 async def main() -> None:
     if not SERVER:
         raise SystemExit("server_url missing in music-bot configuration")
@@ -1005,6 +1036,7 @@ async def main() -> None:
         raise SystemExit("gemini_endpoint and gemini_key are required")
     if _CONTEXT is not None:
         await wait_for_platform()  # let AstrBot finish platform startup
+    asyncio.create_task(discovery_loop())
     while not sio.connected:
         try:
             await sio.connect(
