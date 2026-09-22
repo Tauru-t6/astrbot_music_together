@@ -128,7 +128,7 @@ def apply_config(config: dict) -> None:
     global GEMINI_ENDPOINT, GEMINI_KEY, GEMINI_MODEL, PROXY, PROXIES
     global MAX_REACTIONS, SEGMENT_SECONDS, ANALYZE_LEAD_SECONDS, PERSONA
     global CHAT_SESSION_ID, CHAT_USER, CHAT_PLATFORM_ID
-    global REPLY_ALL_CHAT, IDENTITY_COOKIE
+    global REPLY_ALL_CHAT, IDENTITY_COOKIE, DASH_PORT
 
     CFG = dict(config or {})
     SERVER = str(CFG.get("server_url", "") or "").strip().rstrip("/")
@@ -148,6 +148,7 @@ def apply_config(config: dict) -> None:
     CHAT_USER = str(CFG.get("chat_user", "music-room") or "music-room")
     CHAT_PLATFORM_ID = str(CFG.get("chat_platform_id", "Tauru") or "Tauru")
     REPLY_ALL_CHAT = bool(CFG.get("reply_all_chat", True))
+    DASH_PORT = max(0, min(int(CFG.get("dashboard_port", 6385) or 6385), 65535))
     IDENTITY_COOKIE = "mt_identity=" + issue_identity_token(IDENTITY_SECRET) if IDENTITY_SECRET else ""
 
 
@@ -622,6 +623,106 @@ LAST_CHAT_REPLY = 0.0
 REPLY_ALL_CHAT = bool(CFG.get("reply_all_chat", True))
 
 # ---------------------------------------------------------------------------
+# dashboard state (read by the status page)
+# ---------------------------------------------------------------------------
+
+RECENT_EVENTS: list[dict] = []  # [{ts, kind, text}] newest last, capped
+DASH_PORT = int(CFG.get("dashboard_port", 6385) or 6385)
+
+
+def record_event(kind: str, text: str) -> None:
+    RECENT_EVENTS.append({"ts": time.time(), "kind": kind, "text": text})
+    del RECENT_EVENTS[:-50]
+
+
+def dashboard_status() -> dict:
+    """Snapshot for the status page."""
+    sess = SESSION
+    track: dict = {}
+    pos = 0.0
+    dur = 0.0
+    paused = False
+    if sess:
+        track = {
+            "title": sess.track.get("title", ""),
+            "artist": "/".join(sess.track.get("artist") or []),
+            "cover": sess.track.get("coverUrl") or sess.track.get("cover") or "",
+        }
+        pos = round(sess.position(), 1)
+        dur = sess.duration
+        paused = sess.paused
+    return {
+        "connected": bool(sio.connected),
+        "room_id": ROOM_ID or STATE.get("room_id", ""),
+        "nickname": NICKNAME,
+        "server": SERVER,
+        "listening": sess is not None,
+        "track": track,
+        "position": pos,
+        "duration": dur,
+        "paused": paused,
+        "notes": list(sess.notes[-12:]) if sess else [],
+        "events": RECENT_EVENTS[-20:],
+        "now": time.time(),
+    }
+
+
+async def _handle_dashboard(reader: asyncio.StreamReader,
+                            writer: asyncio.StreamWriter) -> None:
+    try:
+        request = await asyncio.wait_for(reader.read(8192), timeout=5)
+        line = request.split(b"\r\n", 1)[0].decode(errors="replace")
+        path = line.split(" ")[1] if " " in line else "/"
+        if path.startswith("/api/status"):
+            body = json.dumps(dashboard_status(), ensure_ascii=False).encode()
+            ctype = "application/json; charset=utf-8"
+        else:
+            body = _DASHBOARD_HTML.encode()
+            ctype = "text/html; charset=utf-8"
+        writer.write(
+            b"HTTP/1.1 200 OK\r\nContent-Type: " + ctype.encode() +
+            b"\r\nContent-Length: " + str(len(body)).encode() +
+            b"\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n" + body)
+        await writer.drain()
+    except Exception:
+        pass
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+
+_DASHBOARD_SERVER: asyncio.AbstractServer | None = None
+
+try:
+    _DASHBOARD_HTML = (BASE / "dashboard.html").read_text(encoding="utf-8")
+except OSError:
+    _DASHBOARD_HTML = "<!doctype html><title>music-bot</title><p>dashboard.html missing</p>"
+
+
+async def start_dashboard() -> None:
+    """Serve the status page on 127.0.0.1:DASH_PORT (bind-all if configured)."""
+    global _DASHBOARD_SERVER
+    if _DASHBOARD_SERVER is not None or not DASH_PORT:
+        return
+    host = str(CFG.get("dashboard_host", "0.0.0.0") or "0.0.0.0")
+    try:
+        _DASHBOARD_SERVER = await asyncio.start_server(
+            _handle_dashboard, host, DASH_PORT)
+        log.info("dashboard: http://%s:%s/", host, DASH_PORT)
+    except OSError as exc:
+        log.warning("dashboard port %s unavailable: %s", DASH_PORT, exc)
+
+
+async def stop_dashboard() -> None:
+    global _DASHBOARD_SERVER
+    if _DASHBOARD_SERVER is not None:
+        _DASHBOARD_SERVER.close()
+        await _DASHBOARD_SERVER.wait_closed()
+        _DASHBOARD_SERVER = None
+
+# ---------------------------------------------------------------------------
 
 sio = socketio.AsyncClient()
 
@@ -630,6 +731,7 @@ async def post_chat(text: str) -> None:
     if not text or not sio.connected:
         return
     log.info("chat -> %s", text[:80])
+    record_event("danmaku", text[:200])
     await sio.emit("chat:message", {"content": text[:200]})
 
 
@@ -686,6 +788,7 @@ async def listen_along(track: dict) -> None:
     title = track.get("title", "?")
     artist = "/".join(track.get("artist") or [])
     log.info("listening along: %s - %s", title, artist)
+    record_event("sys", f"开始一起听《{title}》- {artist}")
 
     audio, mime = await download_audio(track)
     segments: list[tuple[float, bytes]] = []
@@ -798,6 +901,7 @@ def stop_listen() -> None:
 async def shutdown() -> None:
     """Stop active work and release the Socket.IO connection."""
     stop_listen()
+    await stop_dashboard()
     if sio.connected:
         await sio.disconnect()
 
@@ -1028,6 +1132,7 @@ async def main() -> None:
     if _CONTEXT is not None:
         await wait_for_platform()  # let AstrBot finish platform startup
     asyncio.create_task(discovery_loop())
+    await start_dashboard()
     while not sio.connected:
         try:
             await sio.connect(

@@ -16,5 +16,7 @@
   "chat_session_id": {"type": "text", "default": "music-room", "description": "房间聊天注入的会话桶：填 QQ 会话（如 Tauru:FriendMessage:1125961157）走 aiocqhttp 的 QQ 桶，其他值走 webchat 桶"},
   "chat_platform_id": {"type": "text", "default": "Tauru", "description": "chat_session_id 为 QQ 会话时使用的平台适配器 ID"},
   "chat_user": {"type": "text", "default": "music-room", "description": "webchat 桶的注入用户名（会话创建者）"},
-  "reply_all_chat": {"type": "bool", "default": true, "description": "回应房间里所有非系统聊天；关闭后仅回应包含昵称或 @昵称 的消息"}
+  "reply_all_chat": {"type": "bool", "default": true, "description": "回应房间里所有非系统聊天；关闭后仅回应包含昵称或 @昵称 的消息"},
+  "dashboard_port": {"type": "int", "default": 6385, "description": "状态面板端口（0 关闭）"},
+  "dashboard_host": {"type": "text", "default": "0.0.0.0", "description": "状态面板监听地址，仅本机访问填 127.0.0.1"}
 }
