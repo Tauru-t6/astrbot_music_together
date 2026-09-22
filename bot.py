@@ -153,7 +153,12 @@ def apply_config(config: dict) -> None:
 
 
 def gemini_url() -> str:
-    return GEMINI_ENDPOINT.replace("{model}", GEMINI_MODEL)
+    # Endpoint with a {model} placeholder gets it replaced (official Google
+    # format); a relay that already embeds the model in its path is used
+    # verbatim and gemini_model is ignored.
+    if "{model}" in GEMINI_ENDPOINT:
+        return GEMINI_ENDPOINT.replace("{model}", GEMINI_MODEL)
+    return GEMINI_ENDPOINT
 
 # ---------------------------------------------------------------------------
 # relay Gemini (native generateContent, chrome TLS fingerprint, via mihomo)
