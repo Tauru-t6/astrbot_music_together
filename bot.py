@@ -667,20 +667,109 @@ def dashboard_status() -> dict:
     }
 
 
+# Fields the dashboard is allowed to read/write. Secret values are masked in
+# GET and only replaced when the client sends a non-masked value.
+DASH_EDITABLE = {
+    "gemini_endpoint": "text",
+    "gemini_key": "secret",
+    "gemini_model": "text",
+    "segment_seconds": "float",
+    "analyze_lead_seconds": "float",
+    "persona": "text",
+    "nickname": "text",
+    "reply_all_chat": "bool",
+    "proxy": "text",
+    "chat_session_id": "text",
+    "chat_platform_id": "text",
+    "chat_user": "text",
+}
+
+
+def _overrides_path() -> Path:
+    return STATE_PATH.with_name("dashboard_overrides.json")
+
+
+def _load_overrides() -> dict:
+    return load_json(_overrides_path(), {})
+
+
+def apply_overrides() -> None:
+    """Re-apply config with dashboard overrides layered on top."""
+    merged = dict(CFG)
+    merged.update(_load_overrides())
+    apply_config(merged)
+
+
+def dashboard_config() -> dict:
+    masked = {}
+    for key, kind in DASH_EDITABLE.items():
+        val = CFG.get(key, "")
+        if kind == "secret" and val:
+            masked[key] = "********"
+        else:
+            masked[key] = val
+    return masked
+
+
+def dashboard_update(payload: dict) -> dict:
+    """Validate + persist dashboard config overrides, then hot-apply."""
+    overrides = _load_overrides()
+    changed = {}
+    for key, kind in DASH_EDITABLE.items():
+        if key not in payload:
+            continue
+        val = payload[key]
+        if kind == "secret" and (not val or val == "********"):
+            continue  # untouched masked field
+        if kind == "float":
+            try:
+                val = float(val)
+            except (TypeError, ValueError):
+                continue
+        elif kind == "bool":
+            val = bool(val)
+        else:
+            val = str(val)
+        overrides[key] = val
+        changed[key] = val
+    save_json(_overrides_path(), overrides)
+    apply_overrides()
+    log.info("dashboard config updated: %s", sorted(changed))
+    return dashboard_config()
+
+
 async def _handle_dashboard(reader: asyncio.StreamReader,
                             writer: asyncio.StreamWriter) -> None:
     try:
-        request = await asyncio.wait_for(reader.read(8192), timeout=5)
-        line = request.split(b"\r\n", 1)[0].decode(errors="replace")
-        path = line.split(" ")[1] if " " in line else "/"
+        request = await asyncio.wait_for(reader.read(65536), timeout=5)
+        head, _, rest = request.partition(b"\r\n\r\n")
+        line = head.split(b"\r\n", 1)[0].decode(errors="replace")
+        parts = line.split(" ")
+        method = parts[0].upper() if parts else "GET"
+        path = parts[1] if len(parts) > 1 else "/"
+
+        status = "200 OK"
         if path.startswith("/api/status"):
             body = json.dumps(dashboard_status(), ensure_ascii=False).encode()
+            ctype = "application/json; charset=utf-8"
+        elif path.startswith("/api/config"):
+            if method == "POST":
+                try:
+                    payload = json.loads(rest.decode("utf-8") or "{}")
+                    out = dashboard_update(payload)
+                except (json.JSONDecodeError, ValueError) as exc:
+                    status = "400 Bad Request"
+                    out = {"error": str(exc)}
+            else:
+                out = dashboard_config()
+            body = json.dumps(out, ensure_ascii=False).encode()
             ctype = "application/json; charset=utf-8"
         else:
             body = _DASHBOARD_HTML.encode()
             ctype = "text/html; charset=utf-8"
         writer.write(
-            b"HTTP/1.1 200 OK\r\nContent-Type: " + ctype.encode() +
+            b"HTTP/1.1 " + status.encode() +
+            b"\r\nContent-Type: " + ctype.encode() +
             b"\r\nContent-Length: " + str(len(body)).encode() +
             b"\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n" + body)
         await writer.drain()
@@ -1128,6 +1217,7 @@ async def discovery_loop() -> None:
 
 
 async def main() -> None:
+    apply_overrides()  # layer dashboard-saved overrides on top of base config
     if not SERVER:
         raise SystemExit("server_url missing in music-bot configuration")
     if not IDENTITY_SECRET:
