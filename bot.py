@@ -310,7 +310,6 @@ async def inject_room_chat(user: str, content: str) -> list[str]:
     if context is None:
         return []
     try:
-        from astrbot.core.message.message_event_result import MessageChain
         from astrbot.core.platform import AstrBotMessage, MessageMember, MessageType
         from astrbot.api.message_components import Plain
 
@@ -350,7 +349,7 @@ async def inject_room_chat(user: str, content: str) -> list[str]:
             abm.type = MessageType.FRIEND_MESSAGE
             abm.session_id = session_id
             abm.message_id = message_id
-            abm.message = MessageChain(chain=[Plain(content)])
+            abm.message = [Plain(content)]  # adapters expect a plain list of components
             abm.message_str = content
             abm.raw_message = ("music-bot", CHAT_USER, CHAT_SESSION_ID)
             abm.timestamp = int(time.time())
@@ -1192,11 +1191,11 @@ async def on_chat(message: dict) -> None:
     title = SESSION.track.get("title", "")
     artist = "/".join(SESSION.track.get("artist") or [])
     pos = int(SESSION.position())
+    # 正文以用户原话开头(记忆桶里存的是这句),场景作为简短上下文跟在后面
     replies = await inject_room_chat(
         user,
-        f"（场景：我们正在房间一起听《{title}》-{artist}，播放到第 {pos} 秒。"
-        f"房间用户 {user} 说：“{clean[:100]}”。"
-        "结合此刻的听感自然回应，口语化，不要超过 50 字。）",
+        f"{clean[:100]}\n"
+        f"[听歌场景: 《{title}》-{artist} 第{pos}秒, 简短口语回应, ≤50字]",
     )
     reply = "".join(replies).strip()
     if not reply:
