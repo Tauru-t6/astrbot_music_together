@@ -1005,13 +1005,18 @@ async def _leave_if_still_empty(room_id: str) -> None:
 async def on_rooms(rooms: list) -> None:
     if ROOM_ID_CFG:
         return
+    log.info("room list: %s | current=%s",
+             [(r.get("id"), r.get("userCount")) for r in rooms if isinstance(r, dict)],
+             ROOM_ID)
     if LAST_EMPTY_SINCE and time.time() - LAST_EMPTY_SINCE < 60:
         return  # don't immediately re-create after leaving an empty room
     occupied = [r for r in rooms
-                if isinstance(r, dict) and int(r.get("userCount") or 0) >= 1]
+                if isinstance(r, dict) and int(r.get("userCount") or 0) >= 1
+                and r.get("id") != ROOM_ID]
     # Prefer a room with humans over the empty one we created and saved —
-    # the user will open their own room, not the bot's.
-    if occupied and (not ROOM_ID or occupied[0]["id"] != ROOM_ID):
+    # the user will open their own room, not the bot's. Our own room shows
+    # userCount=1 (the bot itself), so exclude it explicitly above.
+    if occupied:
         if ROOM_ID:
             await sio.emit("room:leave", {})
         target = occupied[0]["id"]
