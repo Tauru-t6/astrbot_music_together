@@ -1232,17 +1232,23 @@ async def main() -> None:
         await wait_for_platform()  # let AstrBot finish platform startup
     asyncio.create_task(discovery_loop())
     await start_dashboard()
-    while not sio.connected:
-        try:
-            await sio.connect(
-                SERVER,
-                headers={"Cookie": IDENTITY_COOKIE},
-                socketio_path="socket.io",
-            )
-        except Exception as exc:
-            log.warning("connect failed: %s; retry in 10s", exc)
-            await asyncio.sleep(10)
-    await sio.wait()
+    # Outer reconnect loop: sio.wait() returns on disconnect, so keep
+    # re-establishing the connection forever instead of letting the plugin
+    # go dark after the first network blip.
+    while True:
+        while not sio.connected:
+            try:
+                await sio.connect(
+                    SERVER,
+                    headers={"Cookie": IDENTITY_COOKIE},
+                    socketio_path="socket.io",
+                )
+            except Exception as exc:
+                log.warning("connect failed: %s; retry in 10s", exc)
+                await asyncio.sleep(10)
+        await sio.wait()
+        log.warning("connection lost; reconnecting in 5s")
+        await asyncio.sleep(5)
 
 
 if __name__ == "__main__":
