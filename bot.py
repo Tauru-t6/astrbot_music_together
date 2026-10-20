@@ -5,6 +5,9 @@ Joins the room as a Socket.IO client, watches playback, downloads the
 current track once, splits it into segments in memory, and asks Gemini to
 listen to each segment *in sync with playback* — analysis is gated on the
 playing state, so pausing the song pauses the bot's listening too.
+
+Owner-following: the bot stays in the room where OWNER_NICKNAME is and
+leaves to search for them when they move. Room votes are auto-approved.
 """
 from __future__ import annotations
 
@@ -14,7 +17,9 @@ import hashlib
 import hmac
 import json
 import os
+import random
 import re
+import threading
 import time
 from pathlib import Path
 from urllib.parse import urlencode, urlparse
@@ -38,6 +43,24 @@ except ImportError:  # standalone mode (python bot.py)
 BASE = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("MUSIC_BOT_CONFIG", BASE / "config.json"))
 STATE_PATH = Path(os.environ.get("MUSIC_BOT_STATE", BASE / "state.json"))
+
+# 公益中转站会把广告拼在响应尾部，从最早的广告特征词处截断
+_AD_MARKERS = ("公益中转", "严禁倒卖", "官方域名", "zhicloud", "QQ群：")
+
+
+def strip_relay_ads(text: str) -> str:
+    cut = None
+    for m in _AD_MARKERS:
+        i = text.find(m)
+        if i != -1 and (cut is None or i < cut):
+            cut = i
+    if cut is None:
+        return text
+    if cut > 0 and text[cut - 1] == "【":
+        cut -= 1  # 连同广告块的左括号一起截掉
+    head = re.sub(r"[—\-–\s]*$", "", text[:cut])
+    return head.strip()
+
 
 # ---------------------------------------------------------------------------
 # config / state / identity
@@ -83,6 +106,19 @@ PERSONA = CFG.get(
 
 PROXIES = {"http": PROXY, "https": PROXY} if PROXY else None
 
+OWNER_NICKNAME = str(CFG.get("owner_nickname", "") or "")
+AUTO_VOTE = bool(CFG.get("auto_vote", True))
+DANMAKU_PER_SONG = 4
+IGNORE_NICKNAMES: set[str] = set()
+REALTIME_ENABLED = bool(CFG.get("realtime_enabled", False))
+REALTIME_URL = str(CFG.get("realtime_url", "") or "")
+REALTIME_KEY = str(CFG.get("realtime_key", "") or "")
+REALTIME_MODEL = str(CFG.get("realtime_model", "qwen3.8-omni-flash-realtime") or "qwen3.8-omni-flash-realtime")
+REALTIME_VOICE = str(CFG.get("realtime_voice", "Sunny") or "Sunny")
+REALTIME_COMMIT_SECONDS = max(15.0, min(float(CFG.get("realtime_commit_seconds", 35) or 35), 120.0))
+REALTIME_DUAL = bool(CFG.get("realtime_dual", False))
+REALTIME_MAX_PER_SONG = max(1, min(int(CFG.get("realtime_max_per_song", 2) or 2), 12))
+
 # Where room chat gets injected. Two shapes:
 #   QQ session  "Tauru:FriendMessage:1125961157" → aiocqhttp platform bucket
 #   anything else (e.g. "music-room")           → webchat adapter bucket
@@ -90,6 +126,9 @@ CHAT_SESSION_ID = str(CFG.get("chat_session_id", "music-room"))
 CHAT_USER = str(CFG.get("chat_user", "music-room"))
 CHAT_PLATFORM_ID = str(CFG.get("chat_platform_id", "Tauru"))
 
+BOT_UID = "music-bot-01"
+REPLY_ALL_CHAT = True
+DASH_PORT = 6385
 _CONTEXT = None
 
 
@@ -99,7 +138,7 @@ def bind_context(context) -> None:
     _CONTEXT = context
 
 
-def issue_identity_token(secret: str, uid: str = "music-bot-01") -> str:
+def issue_identity_token(secret: str, uid: str = BOT_UID) -> str:
     """Self-sign an mt_identity cookie (same HMAC scheme as the server)."""
     now_ms = int(time.time() * 1000)
     payload = {"uid": uid, "iat": now_ms, "exp": now_ms + 30 * 86400 * 1000, "ver": 1}
@@ -110,7 +149,8 @@ def issue_identity_token(secret: str, uid: str = "music-bot-01") -> str:
     return f"{unsigned}.{sig}"
 
 
-IDENTITY_COOKIE = "mt_identity=" + issue_identity_token(IDENTITY_SECRET) if IDENTITY_SECRET else ""
+def identity_cookie(uid: str = BOT_UID) -> str:
+    return "mt_identity=" + issue_identity_token(IDENTITY_SECRET, uid) if IDENTITY_SECRET else ""
 
 
 def set_state_path(path: Path) -> None:
@@ -127,8 +167,10 @@ def apply_config(config: dict) -> None:
     global CFG, SERVER, NICKNAME, ROOM_ID_CFG, IDENTITY_SECRET
     global GEMINI_ENDPOINT, GEMINI_KEY, GEMINI_MODEL, PROXY, PROXIES
     global MAX_REACTIONS, SEGMENT_SECONDS, ANALYZE_LEAD_SECONDS, PERSONA
+    global OWNER_NICKNAME, AUTO_VOTE, DANMAKU_PER_SONG, IGNORE_NICKNAMES
+    global REALTIME_ENABLED, REALTIME_URL, REALTIME_KEY, REALTIME_MODEL, REALTIME_VOICE, REALTIME_COMMIT_SECONDS, REALTIME_DUAL, REALTIME_MAX_PER_SONG
     global CHAT_SESSION_ID, CHAT_USER, CHAT_PLATFORM_ID
-    global REPLY_ALL_CHAT, IDENTITY_COOKIE, DASH_PORT
+    global REPLY_ALL_CHAT, DASH_PORT
 
     CFG = dict(config or {})
     SERVER = str(CFG.get("server_url", "") or "").strip().rstrip("/")
@@ -144,12 +186,26 @@ def apply_config(config: dict) -> None:
     SEGMENT_SECONDS = max(10.0, min(float(CFG.get("segment_seconds", 30)), 180.0))
     ANALYZE_LEAD_SECONDS = max(0.0, min(float(CFG.get("analyze_lead_seconds", 25)), 60.0))
     PERSONA = str(CFG.get("persona", PERSONA) or PERSONA)[:2000]
+    OWNER_NICKNAME = str(CFG.get("owner_nickname", "") or "").strip()
+    AUTO_VOTE = bool(CFG.get("auto_vote", True))
+    DANMAKU_PER_SONG = max(0, min(int(CFG.get("danmaku_per_song", 4) or 4), 12))
+    ignore_raw = CFG.get("ignore_nicknames", "") or ""
+    if isinstance(ignore_raw, (list, tuple)):
+        ignore_raw = ",".join(str(x) for x in ignore_raw)
+    IGNORE_NICKNAMES = {x.strip() for x in str(ignore_raw).split(",") if x.strip()}
+    REALTIME_ENABLED = bool(CFG.get("realtime_enabled", False))
+    REALTIME_URL = str(CFG.get("realtime_url", "") or "").strip()
+    REALTIME_KEY = str(CFG.get("realtime_key", "") or "").strip()
+    REALTIME_MODEL = str(CFG.get("realtime_model", "qwen3.8-omni-flash-realtime") or "qwen3.8-omni-flash-realtime")
+    REALTIME_VOICE = str(CFG.get("realtime_voice", "Sunny") or "Sunny")
+    REALTIME_COMMIT_SECONDS = max(15.0, min(float(CFG.get("realtime_commit_seconds", 35) or 35), 120.0))
+    REALTIME_DUAL = bool(CFG.get("realtime_dual", False))
+    REALTIME_MAX_PER_SONG = max(1, min(int(CFG.get("realtime_max_per_song", 2) or 2), 12))
     CHAT_SESSION_ID = str(CFG.get("chat_session_id", "music-room") or "music-room")
     CHAT_USER = str(CFG.get("chat_user", "music-room") or "music-room")
     CHAT_PLATFORM_ID = str(CFG.get("chat_platform_id", "Tauru") or "Tauru")
     REPLY_ALL_CHAT = bool(CFG.get("reply_all_chat", True))
     DASH_PORT = max(0, min(int(CFG.get("dashboard_port", 6385) or 6385), 65535))
-    IDENTITY_COOKIE = "mt_identity=" + issue_identity_token(IDENTITY_SECRET) if IDENTITY_SECRET else ""
 
 
 def gemini_url() -> str:
@@ -303,12 +359,21 @@ def gemini_text(prompt: str, timeout: int = 60) -> str | None:
 #   aiocqhttp (QQ): the adapter delivers the reply to QQ directly, so we
 #     capture it by wrapping the event class's send path once.
 
+INJECT_LOCK = asyncio.Lock()
+
 
 async def inject_room_chat(user: str, content: str) -> list[str]:
     """Inject one room chat message into the pipeline; collect the reply."""
-    context = _CONTEXT
-    if context is None:
+    if _CONTEXT is None:
         return []
+    # The reply-capture sink is process-wide, so only one injection may be
+    # in flight at a time (matters once several rooms chat simultaneously).
+    async with INJECT_LOCK:
+        return await _inject_room_chat_locked(user, content)
+
+
+async def _inject_room_chat_locked(user: str, content: str) -> list[str]:
+    context = _CONTEXT
     try:
         from astrbot.core.platform import AstrBotMessage, MessageMember, MessageType
         from astrbot.api.message_components import Plain
@@ -455,21 +520,25 @@ async def wait_for_platform(timeout: float = 20.0) -> bool:
 # ---------------------------------------------------------------------------
 
 def rest_get(path: str, params: dict) -> dict | None:
-    if not IDENTITY_COOKIE:
+    cookie = identity_cookie()
+    if not cookie:
         log.warning("REST %s skipped: identity cookie not configured", path)
         return None
     query = urlencode({k: v for k, v in params.items() if v not in (None, "")})
     url = SERVER.rstrip("/") + path + (("?" + query) if query else "")
-    try:
-        r = crequests.get(
-            url, cookies={"mt_identity": IDENTITY_COOKIE.split("=", 1)[1]},
-            proxies=PROXIES, impersonate="chrome", timeout=30,
-        )
-        if r.status_code == 200:
-            return r.json()
-        log.warning("REST %s -> %s %s", path, r.status_code, r.text[:120])
-    except Exception as exc:
-        log.warning("REST %s failed: %s", path, exc)
+    for attempt in (1, 2):
+        try:
+            r = crequests.get(
+                url, cookies={"mt_identity": cookie.split("=", 1)[1]},
+                proxies=PROXIES, timeout=30,
+            )
+            if r.status_code == 200:
+                return r.json()
+            log.warning("REST %s -> %s %s", path, r.status_code, r.text[:120])
+            return None  # a real answer (even an error) - no retry
+        except Exception as exc:
+            log.warning("REST %s failed (attempt %s/2): %s", path, attempt, exc)
+            time.sleep(1)
     return None
 
 # ---------------------------------------------------------------------------
@@ -483,24 +552,13 @@ def duration_of(track: dict) -> float:
         return 0.0
 
 
-async def download_audio(track: dict) -> tuple[bytes | None, str]:
-    url = track.get("streamUrl")
-    source = track.get("source", "netease")
-    if not url:
-        data = await asyncio.to_thread(rest_get, "/api/music/url", {
-            "source": source,
-            "urlId": track.get("urlId"),
-            "bitrate": 192,
-        })
-        if not data or not data.get("url"):
-            return None, ""
-        url = data["url"]
+async def _fetch_audio(url: str, track: dict) -> tuple[bytes, str] | None:
     parsed = urlparse(str(url))
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         log.warning("audio URL has unsupported scheme: %s", str(url)[:120])
-        return None, ""
+        return None
     mime = "audio/mp3"
-    if ".m4a" in url or "m4a" in str(track.get("urlId", "")):
+    if ".m4a" in str(url) or "m4a" in str(track.get("urlId", "")):
         mime = "audio/mp4"
     try:
         r = await asyncio.to_thread(
@@ -515,6 +573,62 @@ async def download_audio(track: dict) -> tuple[bytes | None, str]:
         log.warning("audio download bad: %s %s bytes", r.status_code, len(r.content))
     except Exception as exc:
         log.warning("audio download failed: %s", exc)
+    return None
+
+
+_AUDIO_CACHE: dict = {}
+_AUDIO_CACHE_TS: dict = {}
+
+
+async def download_audio(track: dict) -> tuple[bytes | None, str]:
+    cache_key = str(track.get("urlId") or "")
+    now = time.time()
+    if cache_key and cache_key in _AUDIO_CACHE:
+        if now - _AUDIO_CACHE_TS.get(cache_key, 0) < 1800:
+            log.info("audio cache hit: %s", cache_key)
+            return _AUDIO_CACHE[cache_key]
+    url = track.get("streamUrl")
+    source = track.get("source", "netease")
+    duration = duration_of(track)
+    # We now pull the 64kbps stream (~8KB/s) to keep the Gemini payload small,
+    # so the trial-clip floor has to sit below that: a ~30s netease trial clip
+    # is only ~240KB no matter how long the track claims to be.
+    min_bytes = int(duration * 6 * 1024) if duration else 10000
+
+    async def refresh_url() -> str | None:
+        if not track.get("urlId"):
+            return None
+        data = await asyncio.to_thread(rest_get, "/api/music/url", {
+            "source": source,
+            "urlId": track.get("urlId"),
+            "bitrate": 64,
+        })
+        return data.get("url") if data else None
+
+    # Ask the server for the 64kbps stream up front: the streamUrl baked into
+    # the search result is the user's full-bitrate one (~5-9MB per track), and
+    # that is what made Gemini audio calls stall for 120s+. Fall back to the
+    # baked URL only when the refresh fails.
+    fresh = await refresh_url()
+    got = None
+    if fresh and fresh != url:
+        got = await _fetch_audio(fresh, track)
+        if got is not None and len(got[0]) >= min_bytes:
+            if cache_key:
+                _AUDIO_CACHE[cache_key] = got
+                _AUDIO_CACHE_TS[cache_key] = now
+            return got
+    fallback = await _fetch_audio(url, track) if url else None
+    if fallback is not None and (got is None or len(fallback[0]) > len(got[0])):
+        got = fallback
+        if cache_key and len(got[0]) >= min_bytes:
+            _AUDIO_CACHE[cache_key] = got
+            _AUDIO_CACHE_TS[cache_key] = now
+        return got
+    if got is not None:
+        log.warning("audio looks short: %.0fs track but %.0f KB - trial clip?",
+                    duration, len(got[0]) / 1024)
+        return got
     return None, ""
 
 
@@ -538,7 +652,7 @@ def segment_prompt(track: dict, seg_start: float, seg_end: float, total: float,
         f"{audio_line}\n{earlier_note}\n"
         "输出严格 JSON，不要 Markdown：\n"
         '{"reactions":[{"at":秒,"text":"反应"}]}\n'
-        "at 是相对这个片段开头的秒数；最多 3 条，片头 2 秒内不要有；"
+        "at 是相对这个片段开头的秒数；最多 2 条，片头 2 秒内不要有；"
         "每条不超过 20 个字，短、平、直，像随口嘀咕。没有值得说的就给空数组。"
     )
 
@@ -557,13 +671,13 @@ def clamp_segment_reactions(parsed: dict, seg_start: float, seg_len: float,
             continue
         at = seg_start + max(1.0, min(local_at, seg_len - 1))
         pos = session.position()
-        if at <= pos + 1.0:
-            continue  # already past — never burst old reactions
+        if at <= seg_start:
+            continue  # before segment start (within-segment late reactions are ok) — never burst old reactions
         if session.duration and at > session.duration - 3:
             continue
         out.append({"at": round(at, 1), "text": text})
-        if len(out) >= 3:
-            break
+        if len(out) >= 1:
+            break  # one remark per segment — keep it quiet
     return out
 
 # ---------------------------------------------------------------------------
@@ -573,8 +687,9 @@ def clamp_segment_reactions(parsed: dict, seg_start: float, seg_len: float,
 class ListenSession:
     """One track: playback anchor + reactions posted as the song gets there."""
 
-    def __init__(self, track: dict, play_state: dict):
+    def __init__(self, track: dict, play_state: dict, room_id: str = ""):
         self.track = track
+        self.room_id = room_id
         self.anchor_time = float(play_state.get("currentTime", 0))
         self.anchor_ts = float(play_state.get("serverTimestamp", time.time() * 1000))
         self.paused = not play_state.get("isPlaying", False)
@@ -584,6 +699,7 @@ class ListenSession:
         self.task: asyncio.Task | None = None
         self.sync_task: asyncio.Task | None = None
         self.pause_task: asyncio.Task | None = None
+        self.rt_task: asyncio.Task | None = None
 
     def position(self) -> float:
         if self.paused:
@@ -621,54 +737,118 @@ class ListenSession:
             self.anchor_ts = float(play_state.get("serverTimestamp", time.time() * 1000))
 
 
-SESSION: ListenSession | None = None
-LAST_REVISION = -1
-LAST_CHAT_REPLY = 0.0
-REPLY_ALL_CHAT = bool(CFG.get("reply_all_chat", True))
+# ---------------------------------------------------------------------------
+# realtime companion (qwen omni realtime, raw WS - no SDK dependency)
+# ---------------------------------------------------------------------------
+
+class RealtimeSession:
+    """One song's realtime listening session on a qwen-omni realtime WS.
+
+    The bot feeds the song's 16k PCM paced to the playback clock and calls
+    commit() every REALTIME_COMMIT_SECONDS, so the model drops a short
+    remark on what it just heard. Replies land in a thread-safe queue the
+    feeding task drains (thread -> asyncio handoff without bridges).
+    """
+
+    def __init__(self) -> None:
+        self.closed = False
+        self.ready = threading.Event()   # set on session.updated
+        self.replies: list[str] = []
+        self.ws = None
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        import websocket  # vendored in libs/ for the MaiBot plugin
+        sep = "&" if "?" in REALTIME_URL else "?"
+        self.ws = websocket.WebSocketApp(
+            f"{REALTIME_URL}{sep}model={REALTIME_MODEL}",
+            header={"Authorization": "Bearer " + REALTIME_KEY},
+            on_open=self._on_open, on_message=self._on_message,
+            on_close=self._on_close, on_error=self._on_error)
+        threading.Thread(target=self.ws.run_forever,
+                         kwargs={"ping_interval": 20, "ping_timeout": 10},
+                         daemon=True, name="realtime-ws").start()
+
+    def _on_open(self, ws) -> None:
+        cfg = {
+            "modalities": ["text"],
+            "voice": REALTIME_VOICE,
+            "input_audio_format": "pcm16",
+            "output_audio_format": "pcm24",
+            "input_audio_transcription": {"model": None},
+            "turn_detection": {"type": "server_vad", "threshold": 0.2,
+                               "prefix_padding_ms": 300,
+                               "silence_duration_ms": 800},
+            "instructions": PERSONA + " 你正在和主人实时一起听歌。每听到一段音乐，"
+                            "就随口短评一句刚听到的内容：不超过20字，点评这段里最"
+                            "抓耳的细节（编曲/音色/节奏），不要复述歌词。",
+        }
+        self._send({"event_id": "rt-su", "type": "session.update", "session": cfg})
+        log.info("[realtime] session updated (voice=%s, model=%s)",
+                 REALTIME_VOICE, REALTIME_MODEL)
+
+    def _on_message(self, ws, message) -> None:
+        try:
+            d = json.loads(message)
+        except (ValueError, TypeError):
+            return
+        t = d.get("type", "")
+        if t == "session.updated":
+            self.ready.set()
+        if t in ("response.text.done", "response.audio_transcript.done"):
+            txt = str(d.get("text") or d.get("transcript") or "").strip()
+            if txt:
+                with self._lock:
+                    self.replies.append(txt)
+        elif "error" in t:
+            log.warning("[realtime] %s: %s", t, str(d)[:220])
+
+    def _on_close(self, ws, code, msg) -> None:
+        if not self.closed:
+            log.info("[realtime] ws closed: %s %s", code, str(msg)[:80])
+
+    def _on_error(self, ws, err) -> None:
+        log.warning("[realtime] ws error: %s", str(err)[:120])
+
+    def _send(self, payload: dict) -> None:
+        try:
+            self.ws.send(json.dumps(payload))
+        except Exception as exc:
+            log.warning("[realtime] send failed: %s", exc)
+
+    def append(self, pcm_chunk: bytes) -> None:
+        self._send({"event_id": f"rt-a{time.time_ns()}",
+                    "type": "input_audio_buffer.append",
+                    "audio": base64.b64encode(pcm_chunk).decode()})
+
+    def commit(self) -> None:
+        self._send({"event_id": f"rt-c{time.time_ns()}",
+                    "type": "input_audio_buffer.commit"})
+
+    def drain_replies(self) -> list[str]:
+        with self._lock:
+            out, self.replies = self.replies, []
+        return out
+
+    def close(self) -> None:
+        self.closed = True
+        try:
+            if self.ws:
+                self.ws.close()
+        except Exception:
+            pass
+
 
 # ---------------------------------------------------------------------------
 # dashboard state (read by the status page)
 # ---------------------------------------------------------------------------
 
-RECENT_EVENTS: list[dict] = []  # [{ts, kind, text}] newest last, capped
-DASH_PORT = int(CFG.get("dashboard_port", 6385) or 6385)
+RECENT_EVENTS: list[dict] = []  # [{ts, kind, text, room}] newest last, capped
 
 
-def record_event(kind: str, text: str) -> None:
-    RECENT_EVENTS.append({"ts": time.time(), "kind": kind, "text": text})
+def record_event(kind: str, text: str, room: str = "") -> None:
+    RECENT_EVENTS.append({"ts": time.time(), "kind": kind, "text": text, "room": room})
     del RECENT_EVENTS[:-50]
-
-
-def dashboard_status() -> dict:
-    """Snapshot for the status page."""
-    sess = SESSION
-    track: dict = {}
-    pos = 0.0
-    dur = 0.0
-    paused = False
-    if sess:
-        track = {
-            "title": sess.track.get("title", ""),
-            "artist": "/".join(sess.track.get("artist") or []),
-            "cover": sess.track.get("coverUrl") or sess.track.get("cover") or "",
-        }
-        pos = round(sess.position(), 1)
-        dur = sess.duration
-        paused = sess.paused
-    return {
-        "connected": bool(sio.connected),
-        "room_id": ROOM_ID or STATE.get("room_id", ""),
-        "nickname": NICKNAME,
-        "server": SERVER,
-        "listening": sess is not None,
-        "track": track,
-        "position": pos,
-        "duration": dur,
-        "paused": paused,
-        "notes": list(sess.notes[-12:]) if sess else [],
-        "events": RECENT_EVENTS[-20:],
-        "now": time.time(),
-    }
 
 
 # Fields the dashboard is allowed to read/write. Secret values are masked in
@@ -681,6 +861,13 @@ DASH_EDITABLE = {
     "analyze_lead_seconds": "float",
     "persona": "text",
     "nickname": "text",
+    "owner_nickname": "text",
+    "auto_vote": "bool",
+    "danmaku_per_song": "float",
+    "ignore_nicknames": "text",
+    "realtime_enabled": "bool",
+    "realtime_commit_seconds": "float",
+    "realtime_dual": "bool",
     "reply_all_chat": "bool",
     "proxy": "text",
     "chat_session_id": "text",
@@ -815,412 +1002,965 @@ async def stop_dashboard() -> None:
         await _DASHBOARD_SERVER.wait_closed()
         _DASHBOARD_SERVER = None
 
+
+def dashboard_status() -> dict:
+    """Snapshot for the status page."""
+    bot = BOT
+    if bot is None:
+        return {
+            "connected": False, "room_id": "", "nickname": NICKNAME,
+            "owner_nickname": OWNER_NICKNAME, "server": SERVER,
+            "listening": False, "track": {}, "position": 0.0, "duration": 0.0,
+            "paused": False, "notes": [], "events": RECENT_EVENTS[-20:],
+            "now": time.time(),
+        }
+    sess = bot.session
+    track: dict = {}
+    pos = 0.0
+    dur = 0.0
+    paused = False
+    if sess:
+        track = {
+            "title": sess.track.get("title", ""),
+            "artist": "/".join(sess.track.get("artist") or []),
+            "cover": sess.track.get("coverUrl") or sess.track.get("cover") or "",
+        }
+        pos = round(sess.position(), 1)
+        dur = sess.duration
+        paused = sess.paused
+    return {
+        "connected": bool(bot.sio.connected),
+        "room_id": bot.room_id or "",
+        "room_name": bot.room_name,
+        "owner_nickname": OWNER_NICKNAME,
+        "owner_in_room": bot.owner_here,
+        "nickname": NICKNAME,
+        "server": SERVER,
+        "listening": sess is not None,
+        "track": track,
+        "position": pos,
+        "duration": dur,
+        "paused": paused,
+        "notes": list(sess.notes[-12:]) if sess else [],
+        "events": RECENT_EVENTS[-20:],
+        "now": time.time(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# the bot: one socket, owner-following
 # ---------------------------------------------------------------------------
 
-sio = socketio.AsyncClient()
+VOTE_LABELS = {
+    "next": "切歌",
+    "prev": "上一首",
+    "pause": "暂停播放",
+    "resume": "继续播放",
+    "play-track": "指定播放",
+    "remove-track": "投票移除",
+    "set-mode": "切播放模式",
+}
+
+BOT: "MusicBot | None" = None
 
 
-async def post_chat(text: str) -> None:
-    if not text or not sio.connected:
-        return
-    log.info("chat -> %s", text[:80])
-    record_event("danmaku", text[:200])
-    await sio.emit("chat:message", {"content": text[:200]})
+class MusicBot:
+    """Single companion that follows OWNER_NICKNAME around the lobby."""
 
+    def __init__(self) -> None:
+        self.sio = socketio.AsyncClient()
+        self.room_id: str = ""
+        self.room_name: str = ""
+        self.session: ListenSession | None = None
+        self.last_revision = -1
+        self.last_chat_reply = 0.0
+        self._last_post = 0.0
+        self.humans = 0
+        self.owner_here = False
+        self.owner_id = ""
+        self.probing = False
+        self.empty_since: float | None = None
+        self.created_room = False
+        self._stopped = False
+        self._last_create = 0.0
+        self._follow_task: asyncio.Task | None = None
+        self._discovery_task: asyncio.Task | None = None
+        self._voted_ids: set[str] = set()
+        self._probe_skip: dict[str, float] = {}   # roomId -> blacklist until
+        self._room_counts: dict[str, int] = {}    # roomId -> last userCount
+        self._state_event = asyncio.Event()
+        self._last_state: dict = {}
+        self._bind()
 
-async def wait_until(session: ListenSession, target: float) -> bool:
-    """Sleep until playback reaches `target`. False if the song ended first."""
-    while True:
-        if session.paused:
-            await asyncio.sleep(1.0)
-            continue
-        pos = session.position()
-        if session.duration and pos >= session.duration - 1.0:
-            return False
-        if pos >= target:
-            return True
-        await asyncio.sleep(0.5)
+    # -- wiring --------------------------------------------------------
 
-
-async def sync_loop(session: ListenSession) -> None:
-    """Ask the server for its authority playback clock every ~10s."""
-    try:
-        while sio.connected:
-            await asyncio.sleep(10)
-            await sio.emit("player:sync_request", {})
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        log.warning("sync loop stopped: %s", exc)
-
-
-async def pause_reaction_loop(session: ListenSession) -> None:
-    """Say something once when the user pauses mid-song (deduped per pause)."""
-    try:
-        while True:
-            await asyncio.sleep(1.5)
-            if not session.paused or session.pause_replied:
-                continue
-            session.pause_replied = True
-            pos = int(session.anchor_time)
-            title = session.track.get("title", "")
-            reply = await asyncio.to_thread(
-                gemini_text,
-                f"{PERSONA}\n你们正在一起听《{title}》，用户在第 {pos} 秒按了暂停。"
-                "随口说一句，不超过 20 字，只输出这句话本身。")
-            if reply:
-                await post_chat(reply[:60])
-    except asyncio.CancelledError:
-        raise
-
-
-async def listen_along(track: dict) -> None:
-    session = SESSION
-    if not session:
-        return
-    title = track.get("title", "?")
-    artist = "/".join(track.get("artist") or [])
-    log.info("listening along: %s - %s", title, artist)
-    record_event("sys", f"开始一起听《{title}》- {artist}")
-
-    audio, mime = await download_audio(track)
-    segments: list[tuple[float, bytes]] = []
-    if audio and mime == "audio/mp3":
-        segments = await asyncio.to_thread(
-            split_mp3_seconds, audio, SEGMENT_SECONDS, session.duration
-        )
-        log.info("split into %d segments", len(segments))
-    elif audio:
-        log.info("audio is %s; cannot split, knowledge mode", mime)
-
-    await post_chat(f"♪ 《{title}》，一起听。")
-    session.task = asyncio.current_task()
-    session.sync_task = asyncio.create_task(sync_loop(session))
-    session.pause_task = asyncio.create_task(pause_reaction_loop(session))
-
-    earlier: list[str] = []
-    for seg_start, seg_bytes in segments:
-        seg_end = min(seg_start + SEGMENT_SECONDS,
-                      session.duration or seg_start + SEGMENT_SECONDS)
-        pos = session.position()
-        if pos >= seg_end - 1:
-            continue  # already played past this segment
-
-        # Sync with playback: start "listening" to this segment a little
-        # before it begins, and never while the user has it paused.
-        lead_target = max(1.0, seg_start - ANALYZE_LEAD_SECONDS)
-        if seg_start > 0:
-            await wait_until(session, lead_target)
-        while session.paused:
-            await asyncio.sleep(1.0)
-        if sio.connected is False:
-            return
-
-        prompt = segment_prompt(track, seg_start, seg_end,
-                                session.duration, True, earlier)
-        parts = [{"text": prompt},
-                 {"inline_data": {"mime_type": "audio/mp3",
-                                  "data": base64.b64encode(seg_bytes).decode()}}]
-        log.info("analyzing segment %s-%ss...", int(seg_start), int(seg_end))
+    def _rebuild_sio(self) -> None:
+        """Last-resort recovery: swap in a fresh client so the run loop can
+        escape a wedged connect/wait on the old one."""
+        old = self.sio
+        self.sio = socketio.AsyncClient()
+        self._bind()
         try:
-            parsed = await asyncio.wait_for(
-                asyncio.to_thread(gemini_generate, parts, False), timeout=160)
-        except asyncio.TimeoutError:
-            log.warning("seg %ss: analysis timed out, skipping", int(seg_start))
-            parsed = None
-        reactions = clamp_segment_reactions(parsed, seg_start, SEGMENT_SECONDS, session) \
-            if parsed else []
-        if not reactions:
-            log.info("seg %ss: nothing to say", int(seg_start))
-            continue
+            asyncio.get_running_loop().create_task(old.disconnect())
+        except Exception:
+            pass
+        log.info("socket client rebuilt; the run loop reconnects within ~30s")
 
-        for r in reactions:
-            if not await wait_until(session, r["at"]):
-                break
-            await post_chat(r["text"])
-            earlier.append(r["text"])
-            session.notes.append(f"{int(r['at'])}s {r['text']}")
+    def _bind(self) -> None:
+        s = self.sio
+        s.on("connect", self._on_connect)
+        s.on("disconnect", self._on_disconnect)
+        s.on("room:list_update", self._on_rooms)
+        s.on("room:state", self._on_state)
+        s.on("room:error", self._on_room_error)
+        s.on("room:user_joined", self._on_user_joined)
+        s.on("room:user_left", self._on_user_left)
+        s.on("room:deleted", self._on_room_deleted)
+        s.on("player:play", self._on_play)
+        s.on("player:pause", self._on_pause)
+        s.on("player:resume", self._on_resume)
+        s.on("player:seek", self._on_seek)
+        s.on("player:sync", self._on_sync)
+        s.on("player:next", self._on_next)
+        s.on("chat:message", self._on_chat)
+        s.on("vote:started", self._on_vote_started)
+        s.on("vote:result", self._on_vote_result)
 
-    # knowledge-mode fallback when audio was unavailable or unsplittable
-    if not segments:
-        prompt = segment_prompt(track, 0, session.duration or 240,
-                                session.duration, False, [])
-        parsed = await asyncio.to_thread(gemini_generate, [{"text": prompt}], True)
-        reactions = parsed.get("reactions") or [] if parsed else []
-        cleaned = []
-        for item in reactions[:MAX_REACTIONS]:
+    # -- lifecycle -----------------------------------------------------
+
+    async def run(self) -> None:
+        while not self._stopped:
             try:
-                at = max(3.0, float(item.get("at", 0)))
-                text = str(item.get("text", "")).strip()
-            except (TypeError, ValueError):
+                await asyncio.wait_for(self.sio.connect(
+                    SERVER, headers={"Cookie": identity_cookie(BOT_UID)},
+                    socketio_path="socket.io",
+                ), timeout=30)
+            except Exception as exc:
+                if self._stopped:
+                    return
+                log.warning("connect failed: %s; retry in 10s", exc)
+                await asyncio.sleep(10)
                 continue
-            if text and len(text) <= 40:
-                cleaned.append({"at": at, "text": text})
-        for r in sorted(cleaned, key=lambda x: x["at"]):
-            if not await wait_until(session, r["at"]):
-                break
-            await post_chat(r["text"])
-            session.notes.append(f"{int(r['at'])}s {r['text']}")
+            if self._discovery_task is None or self._discovery_task.done():
+                self._discovery_task = asyncio.create_task(self._discovery_loop())
+            room = ROOM_ID_CFG or str(STATE.get("room_id", "") or "")
+            if room:
+                join_payload: dict = {"roomId": room, "nickname": NICKNAME}
+                rejoin = str(STATE.get("rejoin_token", "") or "")
+                if rejoin and str(STATE.get("room_id", "")) == room:
+                    join_payload["rejoinToken"] = rejoin
+                await self.sio.emit("room:join", join_payload)
+            else:
+                await self.sio.emit("room:list")
+            # sio.wait() can hang forever when a half-dead socket never
+            # emits a disconnect event; poll connectivity instead so a dead
+            # link always falls through to the reconnect path.
+            while not self._stopped and self.sio.connected:
+                await asyncio.sleep(3)
+            if self._stopped:
+                return
+            log.warning("connection lost; reconnecting in 5s")
+            try:
+                await asyncio.wait_for(self.sio.disconnect(), timeout=5)
+            except Exception:
+                pass
+            await asyncio.sleep(5)
 
-    # wait for natural end, then record the wrap-up into the AstrBot
-    # conversation bucket (fire-and-forget; danmaku stays socket-only)
-    if session.duration:
-        await wait_until(session, session.duration - 1.0)
-    if session.notes:
-        notes = "；".join(session.notes[-4:])
-        asyncio.create_task(inject_room_chat(
-            CHAT_USER,
-            f"我们刚一起听完《{title}》-{artist}。我边听边说的：{notes[:180]}。"
-            "用你自己的风格给这段听歌收个尾，一句话，不超过 40 字。"))
-    await post_chat("🎵 听完了。")
+    async def stop(self) -> None:
+        self._stopped = True
+        self._cancel_follow()
+        if self._discovery_task and not self._discovery_task.done():
+            self._discovery_task.cancel()
+        self.stop_listen()
+        if self.sio.connected:
+            try:
+                await self.sio.emit("room:leave", {})
+            except Exception:
+                pass
+            await self.sio.disconnect()
 
+    async def _discovery_loop(self) -> None:
+        """Room-list refresh while idle, plus a connection watchdog.
 
-def start_listen(track: dict, play_state: dict) -> None:
-    global SESSION
-    stop_listen()
-    SESSION = ListenSession(track, play_state)
-    SESSION.task = asyncio.create_task(listen_along(track))
+        A half-closed socket can leave ``sio.wait()`` hanging forever (no
+        disconnect event ever arrives), so whenever the client reports
+        disconnected we force a teardown to re-engage the reconnect loop.
+        """
+        dead = 0
+        try:
+            while not self._stopped:
+                await asyncio.sleep(30)
+                if self._stopped:
+                    continue
+                if not self.sio.connected:
+                    dead += 1
+                    if dead == 2:
+                        log.warning("watchdog: socket down 60s; forcing teardown")
+                        try:
+                            await asyncio.wait_for(self.sio.disconnect(), timeout=5)
+                        except Exception:
+                            pass
+                    elif dead >= 6:
+                        log.warning("watchdog: still down after 3min; rebuilding client")
+                        dead = 0
+                        self._rebuild_sio()
+                    continue
+                dead = 0
+                if self.room_id or self.probing or ROOM_ID_CFG:
+                    continue  # in a room / already searching / pinned
+                await self.sio.emit("room:list")
+        except asyncio.CancelledError:
+            raise
 
+    # -- lobby / room entry ---------------------------------------------
 
-def stop_listen() -> None:
-    global SESSION
-    if SESSION:
-        for task in (SESSION.task, SESSION.sync_task, SESSION.pause_task):
-            if task:
-                task.cancel()
-    SESSION = None
+    async def _on_room_error(self, data: dict) -> None:
+        log.warning("room error: %s", str(data)[:160])
 
+    async def _on_rooms(self, rooms) -> None:
+        """room:list_update — find and join the room where the owner is."""
+        if ROOM_ID_CFG or self._stopped or self.probing:
+            return
+        if self.room_id:
+            return  # already somewhere; owner-left logic handles moving
+        if not isinstance(rooms, list):
+            return
+        entries = [(str(r.get("id")), str(r.get("name") or ""),
+                    int(r.get("userCount") or 0))
+                   for r in rooms if isinstance(r, dict)]
+        # membership changes re-open probing; stable rooms stay blacklisted
+        for rid, _n, cnt in entries:
+            if self._room_counts.get(rid) != cnt:
+                self._probe_skip.pop(rid, None)
+            self._room_counts[rid] = cnt
+        now_ts = time.time()
+        log.info("room list: %s | current=", entries)
+        occupied = [e for e in entries if e[2] >= 1
+                    and self._probe_skip.get(e[0], 0) <= now_ts]
+        if not occupied:
+            if not OWNER_NICKNAME and CFG.get("create_if_missing", True) \
+                    and not self.created_room \
+                    and time.time() - self._last_create > 60:
+                self._last_create = time.time()
+                self.created_room = True
+                log.info("no occupied rooms; creating a waiting room")
+                await self.sio.emit("room:create", {"nickname": NICKNAME, "roomName": "一起听歌"})
+            return
+        if OWNER_NICKNAME:
+            occupied.sort(key=lambda e: 0 if OWNER_NICKNAME in e[1] else 1)
+        self.probing = True
+        try:
+            for rid, rname, _cnt in occupied[:3]:
+                log.info("probing room %s (%s) for %s", rid, rname,
+                         OWNER_NICKNAME or "humans")
+                self._state_event.clear()
+                self._last_state = {}
+                await self.sio.emit("room:join", {"roomId": rid, "nickname": NICKNAME})
+                try:
+                    await asyncio.wait_for(self._state_event.wait(), timeout=6.0)
+                except asyncio.TimeoutError:
+                    log.info("probe %s: no room:state, skipping", rid)
+                    continue
+                st = self._last_state or {}
+                users = st.get("users") or []
+                if self._owner_in(users):
+                    log.info("owner found in room %s (%s)", rid, st.get("name"))
+                    await self._enter_room(st)
+                    return
+                log.info("probe %s: owner not inside; leaving and blacklisting 30min", rid)
+                self._probe_skip[rid] = time.time() + 1800.0
+                await self.sio.emit("room:leave", {})
+                await asyncio.sleep(0.6)
+            log.info("%s not in any occupied room; waiting for the next update",
+                     OWNER_NICKNAME or "humans")
+        finally:
+            self.probing = False
 
-async def shutdown() -> None:
-    """Stop active work and release the Socket.IO connection."""
-    stop_listen()
-    await stop_dashboard()
-    if sio.connected:
-        await sio.disconnect()
+    def _owner_in(self, users: list) -> bool:
+        if not OWNER_NICKNAME:
+            return self.humans > 0
+        for u in users:
+            nick = u.get("nickname") if isinstance(u, dict) else str(u)
+            if nick == OWNER_NICKNAME:
+                return True
+        return False
 
-# ---------------------------------------------------------------------------
-# socket wiring
-# ---------------------------------------------------------------------------
+    def _learn_owner(self, users: list) -> None:
+        """Remember the owner's server userId (vote maps are keyed by id)."""
+        if not OWNER_NICKNAME:
+            return
+        for u in users:
+            if isinstance(u, dict) \
+                    and u.get("nickname") == OWNER_NICKNAME and u.get("id"):
+                uid = str(u["id"])
+                if uid != self.owner_id:
+                    self.owner_id = uid
+                    log.info("owner userId learned: %s", uid)
+                return
 
-ROOM_ID: str = ""
-LAST_EMPTY_SINCE: float | None = None
+    async def _enter_room(self, room: dict) -> None:
+        self.probing = False
+        self.room_id = room.get("id", self.room_id)
+        if self.room_id:
+            STATE["room_id"] = self.room_id
+            save_json(STATE_PATH, STATE)
+        await self._process_state(room)
 
+    # -- room state ------------------------------------------------------
 
-@sio.event
-async def connect() -> None:
-    log.info("connected to %s", SERVER)
-    room = ROOM_ID_CFG or STATE.get("room_id", "")
-    if room:
-        join_payload: dict = {"roomId": room, "nickname": NICKNAME}
-        rejoin = str(STATE.get("rejoin_token", "") or "")
-        if rejoin and STATE.get("room_id") == room:
-            join_payload["rejoinToken"] = rejoin
-        await sio.emit("room:join", join_payload)
-    else:
-        await sio.emit("room:list")
+    async def _on_state(self, room: dict) -> None:
+        self._last_state = room or {}
+        self._state_event.set()
+        if self.probing:
+            return  # probe caller decides
+        await self._process_state(room)
 
+    async def _process_state(self, room: dict) -> None:
+        rid = room.get("id")
+        if rid:
+            self.room_id = str(rid)
+            STATE["room_id"] = self.room_id
+            save_json(STATE_PATH, STATE)
+        self.room_name = str(room.get("name", "") or "")
+        users = room.get("users") or []
+        bot_nicks = {NICKNAME, *IGNORE_NICKNAMES}
+        self.humans = sum(
+            1 for u in users
+            if (u.get("nickname") if isinstance(u, dict) else str(u)) not in bot_nicks)
+        self.owner_here = self._owner_in(users)
+        self._learn_owner(users)
+        log.info("in room %s (%s), users=%s, owner_here=%s",
+                 self.room_id, self.room_name, len(users), self.owner_here)
+        if OWNER_NICKNAME and not ROOM_ID_CFG and not self.created_room \
+                and not self.owner_here:
+            # landed in a room without the owner (stale saved room / drift)
+            log.info("owner %s not here; leaving to search", OWNER_NICKNAME)
+            asyncio.create_task(self._leave_and_discover())
+            return
+        if not ROOM_ID_CFG and not self.created_room and self.humans == 0:
+            if self.empty_since is None:
+                self.empty_since = time.time()
+                log.info("room empty of humans; leaving in 30s unless someone rejoins")
+                asyncio.create_task(self._leave_if_still_empty())
+        else:
+            self.empty_since = None
+        current = room.get("currentTrack")
+        play = room.get("playState") or {}
+        if current and play:
+            self.start_listen(current, play)
 
-@sio.event
-async def disconnect() -> None:
-    log.warning("disconnected; will retry")
+    async def _leave_if_still_empty(self) -> None:
+        await asyncio.sleep(30)
+        if (not self._stopped and self.humans == 0 and self.empty_since
+                and time.time() - self.empty_since >= 30 and self.sio.connected):
+            log.info("room has no real users for 30s; leaving")
+            await self._leave_and_discover()
 
-
-async def leave_empty_room() -> None:
-    """Leave a room with no real users so the bot doesn't squat alone."""
-    global ROOM_ID, LAST_EMPTY_SINCE
-    log.info("room has no real users for 30s; leaving")
-    stop_listen()
-    try:
-        await sio.emit("room:leave", {})
-    except Exception as exc:
-        log.warning("room leave failed: %s", exc)
-    ROOM_ID = ""
-    LAST_EMPTY_SINCE = time.time()
-    await sio.emit("room:list")
-
-
-@sio.on("room:created")
-async def on_created(data: dict) -> None:
-    STATE["room_id"] = data["roomId"]
-    save_json(STATE_PATH, STATE)
-    log.info("room created: %s", data["roomId"])
-
-
-@sio.on("room:deleted")
-async def on_deleted(data: dict) -> None:
-    """The server deleted our saved room (empty grace period expired)."""
-    global ROOM_ID
-    if data and data.get("roomId") in (ROOM_ID, STATE.get("room_id")):
-        ROOM_ID = ""
+    async def _leave_and_discover(self) -> None:
+        if not self.room_id:
+            return  # already out; another path handled it
+        self.room_id = ""  # claim: concurrent callers become no-ops
+        self._cancel_follow()
+        self.stop_listen()
+        self.empty_since = None
+        self.owner_here = False
+        self.humans = 0
+        try:
+            if self.sio.connected:
+                await self.sio.emit("room:leave", {})
+        except Exception as exc:
+            log.warning("room leave failed: %s", exc)
+        self.room_name = ""
         STATE.pop("room_id", None)
         STATE.pop("rejoin_token", None)
         save_json(STATE_PATH, STATE)
-        log.info("saved room was deleted by server; will re-discover")
-        await sio.emit("room:list")
+        if self.sio.connected and not self._stopped:
+            await self.sio.emit("room:list")
 
+    # -- owner tracking ---------------------------------------------------
 
-@sio.on("room:rejoin_token")
-async def on_rejoin(data: dict) -> None:
-    STATE["room_id"] = data["roomId"]
-    STATE["rejoin_token"] = data.get("token", "")
-    save_json(STATE_PATH, STATE)
+    async def _on_user_joined(self, data: dict) -> None:
+        d = data if isinstance(data, dict) else {}
+        nick = str(d.get("nickname", "") or "")
+        if OWNER_NICKNAME and nick == OWNER_NICKNAME:
+            self.owner_here = True
+            self.created_room = False  # the waiting room has its human now
+            self._cancel_follow()
+            if d.get("id"):
+                self.owner_id = str(d["id"])
+            log.info("owner rejoined; staying")
 
+    async def _on_user_left(self, data: dict) -> None:
+        d = data if isinstance(data, dict) else {}
+        nick = str(d.get("nickname", "") or "")
+        if OWNER_NICKNAME and nick == OWNER_NICKNAME and not self._stopped:
+            self.owner_here = False
+            self._cancel_follow()
+            log.info("owner left the room; following in 3s unless they return")
+            self._follow_task = asyncio.create_task(self._follow_owner_left())
 
-@sio.on("room:state")
-async def on_state(room: dict) -> None:
-    global ROOM_ID
-    ROOM_ID = room.get("id", ROOM_ID)
-    STATE["room_id"] = ROOM_ID
-    save_json(STATE_PATH, STATE)
-    users = room.get("users") or []
-    real_users = [u for u in users if (u.get("nickname") if isinstance(u, dict) else u) != NICKNAME]
-    log.info("in room %s (%s), users=%s", ROOM_ID, room.get("name"), len(users))
-    if not ROOM_ID_CFG and not real_users:
-        if STATE.get("room_id") == ROOM_ID:
-            # we created / rejoined this room ourselves — stay and wait for
-            # humans instead of churning a create/leave loop
-            log.info("room empty; staying put and waiting for humans")
-        else:
-            asyncio.create_task(_leave_if_still_empty(ROOM_ID))
-    current = room.get("currentTrack")
-    play = room.get("playState") or {}
-    if current and play:
-        start_listen(current, play)
+    def _cancel_follow(self) -> None:
+        if self._follow_task and not self._follow_task.done():
+            self._follow_task.cancel()
+        self._follow_task = None
 
+    async def _follow_owner_left(self) -> None:
+        try:
+            await asyncio.sleep(3.0)
+        except asyncio.CancelledError:
+            return
+        if self._stopped or self.owner_here or not self.sio.connected:
+            return
+        log.info("owner is gone; leaving to follow")
+        record_event("sys", f"{OWNER_NICKNAME} 离开了，bot 跟着走了", room=self.room_id)
+        await self._leave_and_discover()
 
-async def _leave_if_still_empty(room_id: str) -> None:
-    await asyncio.sleep(30)
-    if ROOM_ID == room_id:
-        await leave_empty_room()
+    async def _on_room_deleted(self, data: dict) -> None:
+        rid = (data or {}).get("roomId")
+        if rid and rid == self.room_id:
+            log.info("current room was deleted by server; re-discovering")
+            await self._leave_and_discover()
 
+    # -- playback ---------------------------------------------------------
 
-@sio.on("room:list_update")
-async def on_rooms(rooms: list) -> None:
-    if ROOM_ID_CFG:
-        return
-    log.info("room list: %s | current=%s",
-             [(r.get("id"), r.get("userCount")) for r in rooms if isinstance(r, dict)],
-             ROOM_ID)
-    if LAST_EMPTY_SINCE and time.time() - LAST_EMPTY_SINCE < 60:
-        return  # don't immediately re-create after leaving an empty room
-    occupied = [r for r in rooms
-                if isinstance(r, dict) and int(r.get("userCount") or 0) >= 1
-                and r.get("id") != ROOM_ID]
-    # Prefer a room with humans over the empty one we created and saved —
-    # the user will open their own room, not the bot's. Our own room shows
-    # userCount=1 (the bot itself), so exclude it explicitly above.
-    if occupied:
-        if ROOM_ID:
-            await sio.emit("room:leave", {})
-        target = occupied[0]["id"]
-        log.info("joining occupied room %s", target)
-        await sio.emit("room:join", {"roomId": target, "nickname": NICKNAME})
-    elif not ROOM_ID and CFG.get("create_if_missing", True):
-        log.info("no occupied rooms; creating one")
-        await sio.emit("room:create", {"nickname": NICKNAME, "roomName": "一起听歌"})
+    @staticmethod
+    def _same_track(a: dict, b: dict) -> bool:
+        ia = a.get("urlId") or a.get("title")
+        ib = b.get("urlId") or b.get("title")
+        return bool(ia) and ia == ib
 
+    def start_listen(self, track: dict, play_state: dict) -> None:
+        dur = duration_of(track)
+        new_pos = float(play_state.get("currentTime", 0) or 0)
+        if dur and new_pos >= dur - 2:
+            return  # song already over - a stale state can't restart it
+        rev = play_state.get("revision")
+        if rev is not None:
+            self.last_revision = rev
+        sess = self.session
+        if sess is not None and self._same_track(sess.track, track) \
+                and sess.task is not None and not sess.task.done():
+            # Same track — never restart or re-anchor. The analysis continues
+            # from where it was, so a reconnect or state refresh can't skip
+            # unprocessed segments. Only sync play/pause state.
+            playing = bool(play_state.get("isPlaying", False))
+            if playing and sess.paused:
+                sess.resume(play_state)
+            elif not playing and not sess.paused:
+                sess.pause(play_state)
+            return
+        self.stop_listen()
+        self.session = ListenSession(track, play_state, room_id=self.room_id)
+        task = asyncio.create_task(self.listen_along(track))
+        task.add_done_callback(self._listen_done)
+        self.session.task = task
 
-@sio.on("player:play")
-async def on_play(data: dict) -> None:
-    track = (data or {}).get("track")
-    play = (data or {}).get("playState") or {}
-    if not track:
-        return
-    global LAST_REVISION
-    revision = play.get("revision")
-    if revision is not None and revision == LAST_REVISION:
-        return
-    LAST_REVISION = revision if revision is not None else LAST_REVISION
-    start_listen(track, play)
+    def _listen_done(self, task) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc:
+            log.error("listen_along crashed: %r", exc)
 
+    def stop_listen(self) -> None:
+        sess = self.session
+        if sess:
+            for task in (sess.task, sess.sync_task, sess.pause_task, sess.rt_task):
+                if task:
+                    task.cancel()
+        self.session = None
 
-@sio.on("player:pause")
-async def on_pause(data: dict) -> None:
-    if SESSION:
-        SESSION.pause(data or {})
-        log.info("playback paused; bot pauses listening too")
+    async def post_chat(self, text: str) -> None:
+        if not text or not self.sio.connected or not self.room_id:
+            return  # roomless emits get NOT_IN_ROOM errors from the server
+        text = strip_relay_ads(text)
+        if not text:
+            log.warning("DEBUG: post_chat stripped to empty")
+            return
+        if not self.room_id:
+            log.warning("DEBUG: post_chat no room_id")
+        gap = time.time() - self._last_post
+        if gap < 8.0:
+            await asyncio.sleep(3.5 - gap)  # 双模型并行时避免同秒双响
+        self._last_post = time.time()
+        log.info("chat -> %s", text[:80])
+        record_event("danmaku", text[:200], room=self.room_id)
+        await self.sio.emit("chat:message", {"content": text[:200]})
 
+    async def wait_until(self, session: ListenSession, target: float) -> bool:
+        """Sleep until playback reaches `target`. False if the song ended first."""
+        while not self._stopped:
+            if session.paused:
+                await asyncio.sleep(1.0)
+                continue
+            pos = session.position()
+            if session.duration and pos >= session.duration - 1.0:
+                return False
+            if pos >= target:
+                return True
+            await asyncio.sleep(0.5)
+        return False
 
-@sio.on("player:resume")
-async def on_resume(data: dict) -> None:
-    if SESSION:
-        SESSION.resume(data or {})
-        log.info("playback resumed")
+    async def _sync_loop(self, session: ListenSession) -> None:
+        """Ask the server for its authority playback clock every ~10s."""
+        try:
+            while self.sio.connected and not self._stopped:
+                await asyncio.sleep(10)
+                await self.sio.emit("player:sync_request", {})
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("sync loop stopped: %s", exc)
 
+    async def _pause_reaction_loop(self, session: ListenSession) -> None:
+        """Say something once when the user pauses mid-song (deduped per pause)."""
+        try:
+            while not self._stopped:
+                await asyncio.sleep(1.5)
+                if not session.paused or session.pause_replied:
+                    continue
+                session.pause_replied = True
+                pos = int(session.anchor_time)
+                title = session.track.get("title", "")
+                reply = await asyncio.to_thread(
+                    gemini_text,
+                    f"{PERSONA}\n你们正在一起听《{title}》，用户在第 {pos} 秒按了暂停。"
+                    "随口说一句，不超过 20 字，只输出这句话本身。")
+                if reply:
+                    await self.post_chat(reply[:60])
+        except asyncio.CancelledError:
+            raise
 
-@sio.on("player:seek")
-async def on_seek(data: dict) -> None:
-    if SESSION:
-        SESSION.seek(data or {})
+    async def listen_along(self, track: dict) -> None:
+        session = self.session
+        if not session:
+            return
+        title = track.get("title", "?")
+        artist = "/".join(track.get("artist") or [])
+        log.info("listening along: %s - %s", title, artist)
+        record_event("sys", f"开始一起听《{title}》- {artist}", room=self.room_id)
 
+        audio, mime = await download_audio(track)
+        segments: list[tuple[float, bytes]] = []
+        if audio:
+            audio = await self._to_mp3(audio, mime)
+            mime = "audio/mp3" if audio else mime
+        if audio and mime == "audio/mp3":
+            segments = await asyncio.to_thread(
+                split_mp3_seconds, audio, SEGMENT_SECONDS, session.duration
+            )
+            log.info("split into %d segments", len(segments))
+        elif audio:
+            log.info("audio is %s; cannot split, knowledge mode", mime)
 
-@sio.on("player:sync")
-async def on_sync(data: dict) -> None:
-    if SESSION:
-        SESSION.sync(data or {})
+        rt_pcm = None
+        if REALTIME_ENABLED and REALTIME_URL and REALTIME_KEY and audio:
+            rt_pcm = await self._to_pcm16(audio)
 
+        session.task = asyncio.current_task()
+        session.sync_task = asyncio.create_task(self._sync_loop(session))
+        session.pause_task = asyncio.create_task(self._pause_reaction_loop(session))
 
-@sio.on("player:next")
-async def on_next(_data: dict) -> None:
-    stop_listen()
+        if rt_pcm is not None:
+            if not REALTIME_DUAL:
+                if await self._listen_realtime(rt_pcm, session,
+                                               max_replies=DANMAKU_PER_SONG,
+                                               primary=True):
+                    return
+                log.warning("realtime unavailable; gemini fallback")
+            else:
+                session.rt_task = asyncio.create_task(self._listen_realtime(
+                    rt_pcm, session, max_replies=REALTIME_MAX_PER_SONG,
+                    primary=False))
+                log.info("dual commentary: realtime<=%s + gemini<=%s",
+                         REALTIME_MAX_PER_SONG, DANMAKU_PER_SONG)
 
+        earlier: list[str] = []
+        budget = max(0, DANMAKU_PER_SONG)
+        react_at: set[int] = set()
+        if segments and budget:
+            n = len(segments)
+            if budget >= n:
+                react_at = set(range(n))
+            elif budget == 1:
+                react_at = {0}
+            else:
+                react_at = {int(round(i * (n - 1) / (budget - 1))) for i in range(budget)}
+        # Analyse every segment we plan to comment on in the background, right
+        # from the top of the song, and let a separate poster loop drop each
+        # remark when playback actually reaches its timestamp. Doing it inline
+        # (one segment at a time, just before it plays) meant the Gemini call
+        # routinely finished after that segment had already passed, so most
+        # remarks were skipped and the survivors bunched up.
+        scheduled: list[dict] = []
 
-@sio.on("chat:message")
-async def on_chat(message: dict) -> None:
-    content = str(message.get("content", ""))
-    user = str(message.get("nickname", ""))
-    msg_type = str(message.get("type", "user"))
-    log.info("chat <- %s: %s", user or "?", content[:60])
-    if msg_type == "system":
-        return
-    if user == NICKNAME or not content:
-        return
-    if not REPLY_ALL_CHAT and NICKNAME not in content \
-            and not content.startswith("@" + NICKNAME):
-        return
-    global LAST_CHAT_REPLY
-    now = time.time()
-    if now - LAST_CHAT_REPLY < 8:
-        return  # avoid rapid-fire loops
-    LAST_CHAT_REPLY = now
-    if SESSION is None:
-        return
-    clean = content.replace(NICKNAME, "").strip()
-    if not clean:
-        return
-    title = SESSION.track.get("title", "")
-    artist = "/".join(SESSION.track.get("artist") or [])
-    pos = int(SESSION.position())
-    # 正文以用户原话开头(记忆桶里存的是这句),场景作为简短上下文跟在后面
-    replies = await inject_room_chat(
-        user,
-        f"{clean[:100]}\n"
-        f"[听歌场景: 《{title}》-{artist} 第{pos}秒, 简短口语回应, ≤50字]",
-    )
-    reply = "".join(replies).strip()
-    if not reply:
-        reply = await asyncio.to_thread(
-            gemini_text,
-            f"{PERSONA}\n你们正在一起听《{title}》-{artist}，播放到第 {pos} 秒。"
-            f"用户说：“{clean[:100]}”。简短回应，不超过 50 字，只输出回应本身。")
-    if reply:
-        await post_chat(reply[:120])
+        async def analyze(seg_idx: int, seg_start: float, seg_bytes: bytes) -> None:
+            seg_end = min(seg_start + SEGMENT_SECONDS,
+                          session.duration or seg_start + SEGMENT_SECONDS)
+            prompt = segment_prompt(track, seg_start, seg_end,
+                                    session.duration, True, list(earlier))
+            parts = [{"text": prompt},
+                     {"inline_data": {"mime_type": "audio/mp3",
+                                      "data": base64.b64encode(seg_bytes).decode()}}]
+            log.info("analyzing segment %s-%ss...", int(seg_start), int(seg_end))
+            try:
+                parsed = await asyncio.wait_for(
+                    asyncio.to_thread(gemini_generate, parts, False, 2, 60),
+                    timeout=150)
+            except asyncio.TimeoutError:
+                log.warning("seg %ss: analysis timed out, skipping", int(seg_start))
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("seg %ss: analysis failed: %r", int(seg_start), exc)
+                return
+            reactions = clamp_segment_reactions(parsed, seg_start, SEGMENT_SECONDS,
+                                                session) if parsed else []
+            if not reactions:
+                log.info("DEBUG-SEG: seg %ss reactions=%s", int(seg_start),
+                         str(parsed)[:200] if parsed else 'None')
+                return
+            for r in reactions:
+                scheduled.append({"at": float(r["at"]), "text": r["text"], "posted": False})
+                log.info("scheduled %ss: %s", int(r["at"]), r["text"][:30])
+
+        targets = [(i, s, b) for i, (s, b) in enumerate(segments) if i in react_at]
+        analysis: asyncio.Task | None = None
+        if targets:
+            sem = asyncio.Semaphore(2)
+
+            async def run_one(i: int, s: float, b: bytes) -> None:
+                # Stagger by playback position: segment N is analysed roughly
+                # ANALYZE_LEAD_SECONDS before it starts playing, so the requests
+                # are naturally spaced out instead of all firing at once (a
+                # burst of parallel audio uploads is what stalled Gemini).
+                if s > 0:
+                    if not await self.wait_until(session, max(1.0, s - ANALYZE_LEAD_SECONDS)):
+                        return
+                async with sem:
+                    if self._stopped or not self.sio.connected:
+                        return
+                    await analyze(i, s, b)
+
+            async def analyze_all() -> None:
+                await asyncio.gather(*(run_one(*t) for t in targets))
+
+            analysis = asyncio.create_task(analyze_all())
+        try:
+            said = 0
+            while analysis is not None and not self._stopped and self.sio.connected:
+                pending = [x for x in scheduled if not x["posted"]]
+                if analysis.done() and not pending:
+                    break
+                if said >= budget:
+                    break
+                due = [x for x in pending if x["at"] <= session.position() + 0.3]
+                if due:
+                    nxt = min(due, key=lambda x: x["at"])
+                    nxt["posted"] = True
+                    said += 1
+                    await self.post_chat(nxt["text"])
+                    earlier.append(nxt["text"])
+                    session.notes.append(f"{int(nxt['at'])}s {nxt['text'][:20]}")
+                    log.info("posted %ss: %s (pos=%.0fs)", int(nxt["at"]),
+                             nxt["text"][:20], session.position())
+                    continue
+                if session.duration and session.position() >= session.duration - 1:
+                    break
+                await asyncio.sleep(0.5)
+        finally:
+            if analysis is not None and not analysis.done():
+                analysis.cancel()
+
+        # knowledge-mode fallback when audio was unavailable or unsplittable
+        if not segments:
+            prompt = segment_prompt(track, 0, session.duration or 240,
+                                    session.duration, False, [])
+            parsed = await asyncio.to_thread(gemini_generate, [{"text": prompt}], True)
+            reactions = parsed.get("reactions") or [] if parsed else []
+            cleaned = []
+            for item in reactions[:DANMAKU_PER_SONG]:
+                try:
+                    at = max(3.0, float(item.get("at", 0)))
+                    text = str(item.get("text", "")).strip()
+                except (TypeError, ValueError):
+                    continue
+                if text and len(text) <= 40:
+                    cleaned.append({"at": at, "text": text})
+            for r in sorted(cleaned, key=lambda x: x["at"]):
+                await self.post_chat(r["text"])
+                session.notes.append(f"{int(r['at'])}s {r['text'][:20]}")
+
+        await self._song_closing(session, title, artist)
+
+    async def _to_mp3(self, audio: bytes, mime: str) -> bytes | None:
+        """Any audio bytes -> mono 48kbps mp3 via ffmpeg.
+
+        netease serves the 64kbps stream as m4a/AAC, which the in-memory MP3
+        frame splitter cannot handle — and the m4a at full bitrate is what
+        stalled Gemini for 120s. Re-encoding once up front gives us a
+        splittable, ~180KB-per-30s payload for every source.
+        """
+        if mime == "audio/mp3" and audio[:3] == b"ID3":
+            return audio
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-loglevel", "error", "-i", "pipe:0",
+                "-vn", "-ac", "1", "-ar", "22050", "-b:a", "48k",
+                "-f", "mp3", "pipe:1",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE)
+            out, _ = await proc.communicate(audio)
+            if proc.returncode == 0 and len(out) > 10000:
+                log.info("audio transcoded to mp3: %.1f KB (from %s)",
+                         len(out) / 1024, mime)
+                return out
+            log.warning("ffmpeg mp3 transcode failed (rc=%s)", proc.returncode)
+        except FileNotFoundError:
+            log.warning("ffmpeg not found; cannot transcode %s", mime)
+        except Exception as exc:
+            log.warning("mp3 transcode error: %s", exc)
+        return None
+
+    async def _to_pcm16(self, audio: bytes) -> bytes | None:
+        """mp3/m4a bytes -> 16kHz mono s16le PCM via ffmpeg."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-loglevel", "error", "-i", "pipe:0",
+                "-ar", "16000", "-ac", "1", "-f", "s16le", "pipe:1",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE)
+            out, _ = await proc.communicate(audio)
+            if proc.returncode == 0 and len(out) > 32000:
+                return out
+            log.warning("ffmpeg pcm conversion failed (rc=%s)", proc.returncode)
+        except FileNotFoundError:
+            log.warning("ffmpeg not found; realtime mode unavailable")
+        except Exception as exc:
+            log.warning("pcm conversion error: %s", exc)
+        return None
+
+    async def _listen_realtime(self, pcm: bytes, session: ListenSession,
+                               max_replies: int = 0, primary: bool = True) -> bool:
+        """Realtime mode: feed the song into a qwen-omni WS session paced to
+        the playback clock; the model drops remarks that we post as danmaku
+        (still capped by the per-song budget). False = session never came up
+        (caller should fall back to the Gemini path)."""
+        if max_replies <= 0:
+            max_replies = DANMAKU_PER_SONG
+        if primary:
+            session.task = asyncio.current_task()
+            session.sync_task = asyncio.create_task(self._sync_loop(session))
+        rt = RealtimeSession()
+        rt.start()
+        for _ in range(30):
+            if rt.ready.is_set():
+                break
+            await asyncio.sleep(0.5)
+        if not rt.ready.is_set():
+            log.warning("realtime session did not come up; gemini fallback")
+            rt.close()
+            return False
+        if session.position() * 32000 >= len(pcm):
+            log.info("playback already past the available audio; gemini fallback")
+            rt.close()
+            return False
+        log.info("realtime listening: %.0fs pcm (commit every %ss)",
+                 len(pcm) / 32000.0, REALTIME_COMMIT_SECONDS)
+        record_event("sys", "realtime 模式陪听中", room=self.room_id)
+        CHUNK = 3200 * 2  # 200ms of 16k s16le
+        since_commit = 0.0
+        pos_bytes = 0
+        rt_said = 0
+        try:
+            while not self._stopped and not rt.closed:
+                for text in rt.drain_replies():
+                    if rt_said >= max_replies or len(session.notes) >= DANMAKU_PER_SONG:
+                        rt.close()
+                        log.info("realtime: danmaku budget spent; closing session")
+                        return True
+                    await self.post_chat(text[:60])
+                    rt_said += 1
+                    session.notes.append(f"{int(session.position())}s {text[:20]}")
+                if session.paused:
+                    await asyncio.sleep(0.4)
+                    continue
+                target_bytes = min(int(session.position() * 32000), len(pcm))
+                if target_bytes >= len(pcm):
+                    if since_commit > 1.0:
+                        rt.commit()  # flush the tail
+                        for _ in range(12):
+                            if rt.drain_replies():
+                                break
+                            await asyncio.sleep(1)
+                    break
+                if target_bytes > pos_bytes:
+                    if target_bytes > pos_bytes + 32000 * 6:
+                        pos_bytes = target_bytes  # big seek: skip ahead
+                    data = pcm[pos_bytes:min(pos_bytes + CHUNK, target_bytes)]
+                    rt.append(data)
+                    pos_bytes += len(data)
+                    since_commit += len(data) / 32000.0
+                    if since_commit >= REALTIME_COMMIT_SECONDS:
+                        rt.commit()
+                        since_commit = 0.0
+                await asyncio.sleep(0.18)
+        finally:
+            rt.close()
+        if primary:
+            await self._song_closing(session,
+                                     session.track.get("title", "?"),
+                                     "/".join(session.track.get("artist") or []))
+        return True
+
+    async def _song_closing(self, session: ListenSession, title: str, artist: str) -> None:
+        if session.duration:
+            await self.wait_until(session, session.duration - 1.0)
+        same_room = bool(self.room_id) and self.room_id == session.room_id
+        if session.notes:
+            notes = "；".join(session.notes[-4:])
+            asyncio.create_task(inject_room_chat(
+                CHAT_USER,
+                f"我们刚一起听完《{title}》-{artist}。我边听边说的：{notes[:180]}。"
+                "用你自己的风格给这段听歌收个尾，一句话，不超过 40 字。"))
+            if same_room:
+                await self.post_chat("🎵 听完了。")
+
+    async def _on_connect(self, *args) -> None:
+        log.info("connected to %s", SERVER)
+
+    async def _on_disconnect(self, *args) -> None:
+        log.warning("disconnected; will retry")
+
+    async def _on_play(self, data: dict) -> None:
+        track = (data or {}).get("track")
+        play = (data or {}).get("playState") or {}
+        if not track:
+            return
+        revision = play.get("revision")
+        if revision is not None and revision == self.last_revision \
+                and self.session is not None:
+            return
+        self.start_listen(track, play)
+
+    async def _on_pause(self, data: dict) -> None:
+        if self.session:
+            self.session.pause(data or {})
+            log.info("playback paused; bot pauses listening too")
+
+    async def _on_resume(self, data: dict) -> None:
+        if self.session:
+            self.session.resume(data or {})
+            log.info("playback resumed")
+
+    async def _on_seek(self, data: dict) -> None:
+        if self.session:
+            self.session.seek(data or {})
+
+    async def _on_sync(self, data: dict) -> None:
+        if self.session:
+            self.session.sync(data or {})
+
+    async def _on_next(self, _data: dict) -> None:
+        self.stop_listen()
+
+    # -- chat --------------------------------------------------------------
+
+    async def _on_chat(self, message: dict) -> None:
+        content = str(message.get("content", ""))
+        user = str(message.get("nickname", ""))
+        msg_type = str(message.get("type", "user"))
+        log.info("chat <- %s: %s", user or "?", content[:60])
+        if msg_type == "system":
+            return
+        if not content or user == NICKNAME or user in IGNORE_NICKNAMES:
+            return  # own messages and fellow bots (e.g. the MaiBot companion)
+        if not REPLY_ALL_CHAT and NICKNAME not in content \
+                and not content.startswith("@" + NICKNAME):
+            return
+        now = time.time()
+        if now - self.last_chat_reply < 8:
+            return  # avoid rapid-fire loops
+        self.last_chat_reply = now
+        clean = content.replace(NICKNAME, "").strip()
+        if not clean:
+            return
+        if self.session is None:
+            # Between songs / not listening — still answer, minus song context.
+            replies = await inject_room_chat(user, clean[:100])
+            reply = "".join(replies).strip()
+            if not reply:
+                reply = await asyncio.to_thread(
+                    gemini_text,
+                    f"{PERSONA}\n用户在房间聊天里说：“{clean[:100]}”。"
+                    "简短回应，不超过 50 字，只输出回应本身。")
+            if reply:
+                await self.post_chat(reply[:120])
+            return
+        title = self.session.track.get("title", "")
+        artist = "/".join(self.session.track.get("artist") or [])
+        pos = int(self.session.position())
+        # 正文以用户原话开头(记忆桶里存的是这句),场景作为简短上下文跟在后面
+        replies = await inject_room_chat(
+            user,
+            f"{clean[:100]}\n"
+            f"[听歌场景: 《{title}》-{artist} 第{pos}秒, 简短口语回应, ≤50字]",
+        )
+        reply = "".join(replies).strip()
+        if not reply:
+            reply = await asyncio.to_thread(
+                gemini_text,
+                f"{PERSONA}\n你们正在一起听《{title}》-{artist}，播放到第 {pos} 秒。"
+                f"用户说：“{clean[:100]}”。简短回应，不超过 50 字，只输出回应本身。")
+        if reply:
+            await self.post_chat(reply[:120])
+
+    # -- votes ---------------------------------------------------------------
+
+    async def _on_vote_started(self, data: dict) -> None:
+        """Mirror the owner's vote: they approve → bot approves, they reject →
+        bot rejects, they don't vote → bot stays out of it entirely."""
+        if not AUTO_VOTE or not isinstance(data, dict):
+            return
+        if not self.owner_id:
+            return  # owner unknown in this room — never push votes either way
+        vid = str(data.get("id", "") or "")
+        if vid and vid in self._voted_ids:
+            return  # already mirrored this vote
+        votes = data.get("votes")
+        if not isinstance(votes, dict) or self.owner_id not in votes:
+            return  # owner hasn't voted; server re-broadcasts on every cast
+        owner_choice = bool(votes[self.owner_id])
+        action = str(data.get("action", "") or "?")
+        by = str(data.get("initiatorNickname", "") or "?")
+        label = VOTE_LABELS.get(action, action)
+        choice = "同意" if owner_choice else "反对"
+        log.info("vote %s (by %s): owner %s — following", label, by, choice)
+        record_event("sys", f"「{label}」投票：主人{choice}，bot 跟随", room=self.room_id)
+        if vid:
+            self._voted_ids.add(vid)
+            if len(self._voted_ids) > 50:
+                self._voted_ids = set(sorted(self._voted_ids)[-25:])
+        await asyncio.sleep(random.uniform(0.8, 2.0))
+        if self._stopped or not self.sio.connected:
+            return
+        await self.sio.emit("vote:cast", {"approve": owner_choice})
+
+    async def _on_vote_result(self, data: dict) -> None:
+        if not isinstance(data, dict):
+            return
+        action = str(data.get("action", "") or "?")
+        label = VOTE_LABELS.get(action, action)
+        outcome = "通过" if data.get("passed") else "未通过"
+        log.info("vote %s: %s", label, outcome)
+        record_event("sys", f"「{label}」投票{outcome}", room=self.room_id)
+
 
 # ---------------------------------------------------------------------------
 
-async def discovery_loop() -> None:
-    """Re-check the room list every 30s while squatting alone in our own
-    room, so we notice when the user opens their own room."""
-    while True:
-        await asyncio.sleep(30)
-        if not sio.connected or ROOM_ID_CFG:
-            continue
-        if SESSION is not None:
-            continue  # actively listening — don't disturb playback
-        await sio.emit("room:list")
-
-
 async def main() -> None:
+    global BOT
     apply_overrides()  # layer dashboard-saved overrides on top of base config
     if not SERVER:
         raise SystemExit("server_url missing in music-bot configuration")
@@ -1230,25 +1970,22 @@ async def main() -> None:
         raise SystemExit("gemini_endpoint and gemini_key are required")
     if _CONTEXT is not None:
         await wait_for_platform()  # let AstrBot finish platform startup
-    asyncio.create_task(discovery_loop())
-    await start_dashboard()
-    # Outer reconnect loop: sio.wait() returns on disconnect, so keep
-    # re-establishing the connection forever instead of letting the plugin
-    # go dark after the first network blip.
-    while True:
-        while not sio.connected:
-            try:
-                await sio.connect(
-                    SERVER,
-                    headers={"Cookie": IDENTITY_COOKIE},
-                    socketio_path="socket.io",
-                )
-            except Exception as exc:
-                log.warning("connect failed: %s; retry in 10s", exc)
-                await asyncio.sleep(10)
-        await sio.wait()
-        log.warning("connection lost; reconnecting in 5s")
-        await asyncio.sleep(5)
+    bot = MusicBot()
+    BOT = bot
+    await bot.run()
+
+
+async def shutdown() -> None:
+    """Stop active work and release the Socket.IO connection."""
+    global BOT
+    bot = BOT
+    BOT = None
+    if bot is not None:
+        try:
+            await bot.stop()
+        except Exception:
+            log.exception("music-bot shutdown failed")
+    await stop_dashboard()
 
 
 if __name__ == "__main__":

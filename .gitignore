@@ -5,3 +5,8 @@ config.json
 config.local.json
 .astrbot_key
 .env
+
+# local backups / runtime artefacts
+*.bak
+*.bak-*
+__pycache__/

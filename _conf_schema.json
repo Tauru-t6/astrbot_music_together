@@ -1,22 +1,162 @@
 {
-  "enabled": {"type": "bool", "default": true, "description": "启用听歌陪伴"},
-  "server_url": {"type": "text", "default": "", "description": "Music Together 服务器地址（含 http）"},
-  "identity_secret": {"type": "text", "default": "", "description": "music-together 服务端的 HMAC 身份密钥"},
-  "room_id": {"type": "text", "default": "", "description": "固定房间号；留空则自动加入有真人的房间"},
-  "nickname": {"type": "text", "default": "小听", "description": "房间内昵称"},
-  "create_if_missing": {"type": "bool", "default": true, "description": "没有可加入房间时自动创建"},
-  "gemini_endpoint": {"type": "text", "default": "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent", "description": "Gemini generateContent 端点；{model} 会替换为模型名"},
-  "gemini_key": {"type": "text", "default": "", "description": "Gemini（或中转服务）API key"},
-  "gemini_model": {"type": "text", "default": "gemini-2.5-flash", "description": "Gemini 模型名"},
-  "proxy": {"type": "text", "default": "", "description": "可选 HTTP 代理（kdysite 中转和 localhost 自动直连）"},
-  "max_reactions": {"type": "int", "default": 4, "description": "音频不可用时最多弹幕数"},
-  "segment_seconds": {"type": "int", "default": 30, "description": "音频分析段长（秒）"},
-  "analyze_lead_seconds": {"type": "int", "default": 25, "description": "提前分析秒数"},
-  "persona": {"type": "text", "default": "你叫小听。语气简短、口语化，像和用户一起听歌时随口点评。不要编造听不到的内容。", "description": "弹幕点评人设"},
-  "chat_session_id": {"type": "text", "default": "music-room", "description": "房间聊天注入的会话桶：填 QQ 会话（如 Tauru:FriendMessage:1125961157）走 aiocqhttp 的 QQ 桶，其他值走 webchat 桶"},
-  "chat_platform_id": {"type": "text", "default": "Tauru", "description": "chat_session_id 为 QQ 会话时使用的平台适配器 ID"},
-  "chat_user": {"type": "text", "default": "music-room", "description": "webchat 桶的注入用户名（会话创建者）"},
-  "reply_all_chat": {"type": "bool", "default": true, "description": "回应房间里所有非系统聊天；关闭后仅回应包含昵称或 @昵称 的消息"},
-  "dashboard_port": {"type": "int", "default": 6385, "description": "状态面板端口（0 关闭）"},
-  "dashboard_host": {"type": "text", "default": "0.0.0.0", "description": "状态面板监听地址，仅本机访问填 127.0.0.1"}
+  "enabled": {
+    "type": "bool",
+    "default": true,
+    "description": "启用听歌陪伴"
+  },
+  "server_url": {
+    "type": "text",
+    "default": "",
+    "description": "Music Together 服务器地址（含 http）"
+  },
+  "identity_secret": {
+    "type": "text",
+    "default": "",
+    "description": "music-together 服务端的 HMAC 身份密钥"
+  },
+  "room_id": {
+    "type": "text",
+    "default": "",
+    "description": "固定房间号（设置后不再跟随）；留空则自动跟随 owner_nickname 所在的房间"
+  },
+  "owner_nickname": {
+    "type": "text",
+    "default": "System-cmd",
+    "description": "要跟随的房间昵称：bot 只待在这个人所在的房间，他离开就跟着走；留空则跟随任意有人的房间"
+  },
+  "auto_vote": {
+    "type": "bool",
+    "default": true,
+    "description": "跟随主人的投票：主人投同意 bot 才同意，主人投反对 bot 也反对，主人没投 bot 弃权"
+  },
+  "danmaku_per_song": {
+    "type": "int",
+    "default": 4,
+    "description": "每首歌最多发的弹幕条数（均摊到全曲，每段最多 1 条）"
+  },
+  "ignore_nicknames": {
+    "type": "text",
+    "default": "麦麦",
+    "description": "忽略这些昵称的消息（逗号分隔），防止多个陪伴 bot 互相触发"
+  },
+  "nickname": {
+    "type": "text",
+    "default": "小听",
+    "description": "房间内昵称"
+  },
+  "create_if_missing": {
+    "type": "bool",
+    "default": true,
+    "description": "没有可加入房间时自动创建（仅未配置 owner_nickname 时生效）"
+  },
+  "gemini_endpoint": {
+    "type": "text",
+    "default": "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+    "description": "Gemini generateContent 端点；{model} 会替换为模型名"
+  },
+  "gemini_key": {
+    "type": "text",
+    "default": "",
+    "description": "Gemini（或中转服务）API key"
+  },
+  "gemini_model": {
+    "type": "text",
+    "default": "gemini-2.5-flash",
+    "description": "Gemini 模型名"
+  },
+  "proxy": {
+    "type": "text",
+    "default": "",
+    "description": "可选 HTTP 代理（kdysite 中转和 localhost 自动直连）"
+  },
+  "max_reactions": {
+    "type": "int",
+    "default": 4,
+    "description": "音频不可用时最多弹幕数"
+  },
+  "segment_seconds": {
+    "type": "int",
+    "default": 30,
+    "description": "音频分析段长（秒）"
+  },
+  "analyze_lead_seconds": {
+    "type": "int",
+    "default": 25,
+    "description": "提前分析秒数"
+  },
+  "persona": {
+    "type": "text",
+    "default": "你叫小听。语气简短、口语化，像和用户一起听歌时随口点评。不要编造听不到的内容。",
+    "description": "弹幕点评人设"
+  },
+  "chat_session_id": {
+    "type": "text",
+    "default": "music-room",
+    "description": "房间聊天注入的会话桶：填 QQ 会话（如 Tauru:FriendMessage:1125961157）走 aiocqhttp 的 QQ 桶，其他值走 webchat 桶"
+  },
+  "chat_platform_id": {
+    "type": "text",
+    "default": "Tauru",
+    "description": "chat_session_id 为 QQ 会话时使用的平台适配器 ID"
+  },
+  "chat_user": {
+    "type": "text",
+    "default": "music-room",
+    "description": "webchat 桶的注入用户名（会话创建者）"
+  },
+  "reply_all_chat": {
+    "type": "bool",
+    "default": true,
+    "description": "回应房间里所有非系统聊天；关闭后仅回应包含昵称或 @昵称 的消息"
+  },
+  "dashboard_port": {
+    "type": "int",
+    "default": 6385,
+    "description": "状态面板端口（0 关闭）"
+  },
+  "dashboard_host": {
+    "type": "text",
+    "default": "0.0.0.0",
+    "description": "状态面板监听地址，仅本机访问填 127.0.0.1"
+  },
+  "realtime_enabled": {
+    "type": "bool",
+    "default": false,
+    "description": "启用 Realtime 实时陪听（qwen-omni realtime，边听边点评；关闭则走 Gemini 批量分析）"
+  },
+  "realtime_url": {
+    "type": "text",
+    "default": "",
+    "description": "Realtime WebSocket 地址（wss://...）"
+  },
+  "realtime_key": {
+    "type": "text",
+    "default": "",
+    "description": "Realtime API key"
+  },
+  "realtime_model": {
+    "type": "text",
+    "default": "qwen3.8-omni-flash-realtime",
+    "description": "Realtime 模型名"
+  },
+  "realtime_voice": {
+    "type": "text",
+    "default": "Sunny",
+    "description": "音色（该部署仅实测 Sunny 可用）"
+  },
+  "realtime_commit_seconds": {
+    "type": "int",
+    "default": 35,
+    "description": "每隔多少秒提交一次音频、让模型点评一次"
+  },
+  "realtime_dual": {
+    "type": "bool",
+    "default": false,
+    "description": "双开点评：realtime 氛围点评 + Gemini 细节点评并行（需 realtime_enabled）"
+  },
+  "realtime_max_per_song": {
+    "type": "int",
+    "default": 2,
+    "description": "双开时 realtime 每首歌最多发几条（总上限仍是 danmaku_per_song）"
+  }
 }

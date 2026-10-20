@@ -24,7 +24,11 @@ if str(_BASE) not in sys.path:
 import bot
 
 _KEYS = (
-    "enabled", "server_url", "identity_secret", "room_id", "nickname",
+    "enabled", "server_url", "identity_secret", "room_id", "owner_nickname",
+    "auto_vote", "danmaku_per_song", "ignore_nicknames", "nickname",
+    "realtime_enabled", "realtime_url", "realtime_key", "realtime_model",
+    "realtime_voice", "realtime_commit_seconds", "realtime_dual",
+    "realtime_max_per_song",
     "create_if_missing", "gemini_endpoint", "gemini_key", "gemini_model",
     "proxy", "max_reactions", "segment_seconds", "analyze_lead_seconds",
     "persona", "chat_session_id", "chat_platform_id", "chat_user",
@@ -38,7 +42,7 @@ def _config_dict(config: AstrBotConfig) -> dict[str, Any]:
     return {key: config.get(key) for key in _KEYS}
 
 
-@register("astrbot_plugin_music_bot", "Tauru-t6", "Music Together Companion", "0.3.5")
+@register("astrbot_plugin_music_bot", "Tauru-t6", "Music Together Companion", "0.6.2")
 class MusicBotPlugin(Star):
     """Own the listener task from AstrBot's plugin lifecycle."""
 

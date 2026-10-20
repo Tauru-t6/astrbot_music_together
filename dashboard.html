@@ -180,6 +180,12 @@
           <input id="f_lead" type="number" min="0" max="60" step="1"></label>
         <label class="f">Bot 昵称
           <input id="f_nick"></label>
+        <label class="f">跟随目标昵称(owner_nickname)
+          <input id="f_owner" placeholder="System-cmd（留空=跟随任意有人房间）"></label>
+        <label class="f">每首歌弹幕上限
+          <input id="f_danmaku" type="number" min="0" max="12" step="1"></label>
+        <label class="f">忽略昵称(防多 bot 互聊)
+          <input id="f_ignore" placeholder="麦麦"></label>
         <label class="f">HTTP 代理(可空)
           <input id="f_proxy" placeholder="http://127.0.0.1:7890"></label>
         <label class="f full">人设 prompt
@@ -189,6 +195,11 @@
         <label class="f">平台 ID(chat_platform_id)
           <input id="f_chat_platform" placeholder="Tauru"></label>
         <label class="f chk full"><input id="f_reply_all" type="checkbox"> 回应房间里所有聊天(关闭则仅 @ 或含昵称)</label>
+        <label class="f chk full"><input id="f_auto_vote" type="checkbox"> 跟随主人的投票(主人投 bot 才投,主人没投 bot 弃权)</label>
+        <label class="f chk full"><input id="f_realtime" type="checkbox"> Realtime 实时陪听(qwen-omni,边听边点评)</label>
+        <label class="f chk full"><input id="f_rt_dual" type="checkbox"> 双开点评(realtime 氛围 + Gemini 细节)</label>
+        <label class="f">Realtime 点评间隔(秒)
+          <input id="f_rt_commit" type="number" min="15" max="120" step="5"></label>
       </div>
       <div class="row">
         <button class="save" id="saveBtn">保存并热生效</button>
@@ -276,6 +287,10 @@ const FIELD_MAP = {
   f_seg: "segment_seconds",
   f_lead: "analyze_lead_seconds",
   f_nick: "nickname",
+  f_owner: "owner_nickname",
+  f_ignore: "ignore_nicknames",
+  f_rt_commit: "realtime_commit_seconds",
+  f_rt_dual: "realtime_dual",
   f_proxy: "proxy",
   f_persona: "persona",
   f_chat_session: "chat_session_id",
@@ -291,6 +306,10 @@ async function loadConfig() {
       if (el && cfg[key] !== undefined) el.value = cfg[key];
     }
     $("f_reply_all").checked = !!cfg.reply_all_chat;
+    $("f_auto_vote").checked = cfg.auto_vote !== undefined ? !!cfg.auto_vote : true;
+    $("f_realtime").checked = !!cfg.realtime_enabled;
+    $("f_rt_dual").checked = !!cfg.realtime_dual;
+    if (cfg.realtime_commit_seconds !== undefined) $("f_rt_commit").value = cfg.realtime_commit_seconds;
   } catch { /* panel without config API */ }
 }
 
@@ -298,12 +317,15 @@ $("saveBtn").addEventListener("click", async () => {
   const btn = $("saveBtn"), msg = $("saveMsg");
   btn.disabled = true;
   msg.textContent = "";
-  const payload = { reply_all_chat: $("f_reply_all").checked };
+  const payload = { reply_all_chat: $("f_reply_all").checked,
+                    auto_vote: $("f_auto_vote").checked,
+                    realtime_enabled: $("f_realtime").checked,
+                    realtime_dual: $("f_rt_dual").checked };
   for (const [id, key] of Object.entries(FIELD_MAP)) {
     const el = $(id);
     if (!el) continue;
     if (key === "gemini_key" && (!el.value || el.value === "********")) continue;
-    if (["segment_seconds", "analyze_lead_seconds"].includes(key)) {
+    if (["segment_seconds", "analyze_lead_seconds", "danmaku_per_song", "realtime_commit_seconds"].includes(key)) {
       payload[key] = parseFloat(el.value);
     } else {
       payload[key] = el.value;
