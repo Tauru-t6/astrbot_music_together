@@ -1,2 +1,3 @@
 python-socketio[client]>=5.11,<6
 curl-cffi>=0.7,<1
+websocket-client>=1.6,<2

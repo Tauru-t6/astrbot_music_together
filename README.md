@@ -153,7 +153,7 @@ python bot.py
 
 ### 插件没有加载
 
-检查插件目录中直接存在 `main.py` 和 `metadata.yaml`，AstrBot 版本满足要求，`requirements.txt` 已安装，尤其是 `python-socketio` 和 `curl-cffi`，然后重启 AstrBot 查看加载日志。
+检查插件目录中直接存在 `main.py` 和 `metadata.yaml`，AstrBot 版本满足要求，`requirements.txt` 已安装，尤其是 `python-socketio`、`curl-cffi` 和 `websocket-client`（realtime 模式需要），然后重启 AstrBot 查看加载日志。
 
 ### 日志提示缺少配置
 

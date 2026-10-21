@@ -1,5 +1,15 @@
 # 更新日志
 
+## [0.6.4] / [1.3.4] - 2026-10-21
+
+### 修复（上架审核第二轮）
+
+- **事件循环阻塞（并发模型）**：`RealtimeSession` 原先在 asyncio 事件循环线程里直接调用 websocket-client 的 `self.ws.send()`（同步 socket 写）。对端 TCP 背压或 TLS 卡住时会把整个 AstrBot 事件循环冻住。现在改成有界发送队列（`_RT_OUTBOX_MAX = 64`，约 13 秒音频余量）+ 独立 `realtime-tx` 发送线程：`append()`/`commit()` 只做 `put_nowait`，永不阻塞；队列满时丢帧并告警，不会拖住事件循环。
+- **依赖缺失导致整首歌静默**：`realtime` 模式 `import websocket` 在 `requirements.txt` 里没有声明，发布包也没有 `libs/` 目录，`realtime_enabled=true` 时会 `ImportError` 并让 `listen_along` 整个任务崩掉。现在：① `requirements.txt` 增加 `websocket-client>=1.6,<2`；② `RealtimeSession.start()` 捕获 `ImportError` 返回 `False`，调用方据此回退到 Gemini 路径；③ `start()` 放到 `asyncio.to_thread` 执行，不再阻塞事件循环；④ `_listen_realtime` 循环体加了异常兜底，任何 realtime 故障都只降级不崩任务。
+
+### 说明
+
+- 第 3 点（`_install_qq_send_capture` 对 `AiocqhttpMessageEvent.send` 做 monkey-patch）属于提示性建议，本轮未改：捕获仅在注入期间生效、带注释保护，改动会牵涉 QQ 桶回复采集的可用性，留待后续用官方 hook 替换。
 ## [0.6.3] / [1.3.3] - 2026-10-21
 
 ### 修复（插件市场上架审核）

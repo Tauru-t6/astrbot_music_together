@@ -17,6 +17,7 @@ import hashlib
 import hmac
 import json
 import os
+import queue
 import random
 import re
 import sys
@@ -184,6 +185,9 @@ REALTIME_VOICE = str(CFG.get("realtime_voice", "Sunny") or "Sunny")
 REALTIME_COMMIT_SECONDS = max(15.0, min(float(CFG.get("realtime_commit_seconds", 35) or 35), 120.0))
 REALTIME_DUAL = bool(CFG.get("realtime_dual", False))
 REALTIME_MAX_PER_SONG = max(1, min(int(CFG.get("realtime_max_per_song", 2) or 2), 12))
+# Outbound WS frames buffered before we start dropping audio. One frame
+# is ~200ms of audio, so this is ~13s of slack for a slow peer.
+_RT_OUTBOX_MAX = 64
 
 # Where room chat gets injected. Two shapes:
 #   QQ session  "Tauru:FriendMessage:1125961157" → aiocqhttp platform bucket
@@ -823,18 +827,31 @@ class RealtimeSession:
         self.replies: list[str] = []
         self.ws = None
         self._lock = threading.Lock()
+        self._outbox: queue.Queue = queue.Queue(maxsize=_RT_OUTBOX_MAX)
+        self._dropped = 0
+        self._sender: threading.Thread | None = None
 
-    def start(self) -> None:
-        import websocket  # vendored in libs/ for the MaiBot plugin
+    def start(self) -> bool:
+        """Bring the WS up. False = dependency missing (caller falls back)."""
+        try:
+            import websocket  # provided by the `websocket-client` dependency
+        except ImportError as exc:
+            log.warning("[realtime] websocket-client not installed (%s); "
+                        "realtime mode unavailable", exc)
+            return False
         sep = "&" if "?" in REALTIME_URL else "?"
         self.ws = websocket.WebSocketApp(
             f"{REALTIME_URL}{sep}model={REALTIME_MODEL}",
             header={"Authorization": "Bearer " + REALTIME_KEY},
             on_open=self._on_open, on_message=self._on_message,
             on_close=self._on_close, on_error=self._on_error)
+        self._sender = threading.Thread(target=self._sender_loop,
+                                        daemon=True, name="realtime-tx")
+        self._sender.start()
         threading.Thread(target=self.ws.run_forever,
                          kwargs={"ping_interval": 20, "ping_timeout": 10},
                          daemon=True, name="realtime-ws").start()
+        return True
 
     def _on_open(self, ws) -> None:
         cfg = {
@@ -850,7 +867,7 @@ class RealtimeSession:
                             "就随口短评一句刚听到的内容：不超过20字，点评这段里最"
                             "抓耳的细节（编曲/音色/节奏），不要复述歌词。",
         }
-        self._send({"event_id": "rt-su", "type": "session.update", "session": cfg})
+        self._enqueue({"event_id": "rt-su", "type": "session.update", "session": cfg})
         log.info("[realtime] session updated (voice=%s, model=%s)",
                  REALTIME_VOICE, REALTIME_MODEL)
 
@@ -877,20 +894,51 @@ class RealtimeSession:
     def _on_error(self, ws, err) -> None:
         log.warning("[realtime] ws error: %s", str(err)[:120])
 
-    def _send(self, payload: dict) -> None:
+    def _enqueue(self, payload: dict) -> None:
+        """Queue an outbound frame; never touches the socket from here.
+
+        websocket-client's send() is a blocking socket write, so calling it
+        from the asyncio event-loop thread would freeze the whole bot if the
+        peer stalls (TCP backpressure / stuck TLS). Frames go through a
+        bounded queue that a dedicated sender thread drains instead.
+        """
+        if self.closed:
+            return
         try:
-            self.ws.send(json.dumps(payload))
-        except Exception as exc:
-            log.warning("[realtime] send failed: %s", exc)
+            self._outbox.put_nowait(payload)
+        except queue.Full:
+            # Peer is not keeping up: drop this frame rather than block.
+            self._dropped += 1
+            if self._dropped == 1 or self._dropped % 50 == 0:
+                log.warning("[realtime] outbox full; dropped %d frame(s)",
+                            self._dropped)
+
+    def _sender_loop(self) -> None:
+        """Drain the outbox on a worker thread (blocking writes live here)."""
+        while not self.closed:
+            try:
+                payload = self._outbox.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if payload is None:
+                break
+            ws = self.ws
+            if ws is None:
+                continue
+            try:
+                ws.send(json.dumps(payload))
+            except Exception as exc:
+                log.warning("[realtime] send failed: %s", exc)
+                break
 
     def append(self, pcm_chunk: bytes) -> None:
-        self._send({"event_id": f"rt-a{time.time_ns()}",
-                    "type": "input_audio_buffer.append",
-                    "audio": base64.b64encode(pcm_chunk).decode()})
+        self._enqueue({"event_id": f"rt-a{time.time_ns()}",
+                       "type": "input_audio_buffer.append",
+                       "audio": base64.b64encode(pcm_chunk).decode()})
 
     def commit(self) -> None:
-        self._send({"event_id": f"rt-c{time.time_ns()}",
-                    "type": "input_audio_buffer.commit"})
+        self._enqueue({"event_id": f"rt-c{time.time_ns()}",
+                       "type": "input_audio_buffer.commit"})
 
     def drain_replies(self) -> list[str]:
         with self._lock:
@@ -899,6 +947,10 @@ class RealtimeSession:
 
     def close(self) -> None:
         self.closed = True
+        try:
+            self._outbox.put_nowait(None)   # wake the sender thread
+        except queue.Full:
+            pass
         try:
             if self.ws:
                 self.ws.close()
@@ -1612,9 +1664,15 @@ class MusicBot:
             session.task = asyncio.current_task()
             session.sync_task = asyncio.create_task(self._sync_loop(session))
         rt = RealtimeSession()
-        rt.start()
+        # start() only spawns threads and returns; it must never block or
+        # raise, otherwise the whole listen_along task dies and the song goes
+        # silent. A missing websocket-client is a normal fallback condition.
+        if not await asyncio.to_thread(rt.start):
+            log.warning("realtime transport unavailable; gemini fallback")
+            rt.close()
+            return False
         for _ in range(30):
-            if rt.ready.is_set():
+            if rt.ready.is_set() or rt.closed:
                 break
             await asyncio.sleep(0.5)
         if not rt.ready.is_set():
@@ -1665,6 +1723,11 @@ class MusicBot:
                         rt.commit()
                         since_commit = 0.0
                 await asyncio.sleep(0.18)
+        except Exception as exc:
+            # Never let a realtime hiccup take down the whole listening task.
+            log.warning("realtime loop failed: %r; falling back", exc)
+            rt.close()
+            return False
         finally:
             rt.close()
         if primary:
