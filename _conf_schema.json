@@ -12,7 +12,7 @@
   "identity_secret": {
     "type": "text",
     "default": "",
-    "description": "music-together 服务端的 HMAC 身份密钥"
+    "description": "你自己 music-together 服务端的 HMAC 身份密钥（仅用于签发进入该服务器的 mt_identity cookie，不要填入他人服务器的密钥）"
   },
   "room_id": {
     "type": "text",

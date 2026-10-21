@@ -80,12 +80,14 @@ Music Together Socket.IO -> 读取歌曲状态 -> 下载音频 -> MP3 切片 -> 
 
 插件配置文件由 AstrBot 管理。不要把真实密钥写入仓库，也不要把生产环境的 `config.json`、`state.json` 或 `.astrbot_key` 提交到 Git。
 
+> **关于 `identity_secret`**：插件用它在本地签发 `mt_identity` cookie，作为加入房间的身份凭证（HMAC-SHA256 签名，与 music-together 服务端一致）。该密钥**只用于连接你自己部署/持有的 music-together 服务端**，不要填入他人服务器的密钥，也不要把它用于任何第三方服务。插件不会把该密钥发送到除你配置的 `server_url` 之外的任何地址。
+
 ### 必填字段
 
 | 字段 | 说明 | 示例 |
 | --- | --- | --- |
 | `server_url` | Music Together 服务地址 | `http://127.0.0.1:3011` |
-| `identity_secret` | 服务端 HMAC secret | 在服务端配置中获取 |
+| `identity_secret` | **你自己** music-together 服务端的 HMAC 身份密钥，用于签发进入该服务器的 `mt_identity` cookie | 在你自己服务端的配置中获取 |
 | `gemini_endpoint` | Gemini-compatible `generateContent` 地址 | `https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent` |
 | `gemini_key` | Gemini 或中转服务 API key | 只在 AstrBot 配置中填写 |
 | `gemini_model` | 使用的模型名 | `gemini-2.5-flash` |
@@ -122,6 +124,8 @@ Music Together Socket.IO -> 读取歌曲状态 -> 下载音频 -> MP3 切片 -> 
 | `reply_all_chat` | `true` | 是否回应房间里的所有非系统聊天。关闭后，仅在消息包含机器人昵称或 `@昵称` 时回应。 |
 
 歌曲收尾也走同一条注入管道，以人设风格发一句结束语；注入不可用时不发收尾（弹幕反应不受影响）。
+
+> **QQ 桶的实现说明**：webchat 桶通过 `webchat_queue_mgr` 的 back-queue 取回复；aiocqhttp（QQ）桶的回复由适配器直接发往 QQ，没有等价的回传通道，因此插件在**首次注入时**对 `AiocqhttpMessageEvent.send` 做一次进程级包装以捕获回复。包装仅在注入等待期间（`capture.queue is not None`）拦截，其余时间直接透传到原方法；不修改会话历史、不写数据库。如果你不希望任何 monkey-patch，把 `chat_session_id` 保持为非 QQ 值（如 `music-room`）即可完全避开这条路径。
 
 仓库中的 [config.example.json](config.example.json) 只包含占位值，可以作为字段参考。AstrBot 安装时直接在 WebUI 配置，不需要创建这个文件。
 
