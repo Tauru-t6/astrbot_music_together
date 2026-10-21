@@ -109,16 +109,6 @@
     "default": true,
     "description": "回应房间里所有非系统聊天；关闭后仅回应包含昵称或 @昵称 的消息"
   },
-  "dashboard_port": {
-    "type": "int",
-    "default": 6385,
-    "description": "状态面板端口（0 关闭）"
-  },
-  "dashboard_host": {
-    "type": "text",
-    "default": "0.0.0.0",
-    "description": "状态面板监听地址，仅本机访问填 127.0.0.1"
-  },
   "realtime_enabled": {
     "type": "bool",
     "default": false,

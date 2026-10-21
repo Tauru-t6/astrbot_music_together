@@ -32,7 +32,7 @@ _KEYS = (
     "create_if_missing", "gemini_endpoint", "gemini_key", "gemini_model",
     "proxy", "max_reactions", "segment_seconds", "analyze_lead_seconds",
     "persona", "chat_session_id", "chat_platform_id", "chat_user",
-    "reply_all_chat", "dashboard_port", "dashboard_host",
+    "reply_all_chat",
 )
 
 
@@ -42,7 +42,7 @@ def _config_dict(config: AstrBotConfig) -> dict[str, Any]:
     return {key: config.get(key) for key in _KEYS}
 
 
-@register("astrbot_plugin_music_bot", "Tauru-t6", "Music Together Companion", "0.6.2")
+@register("astrbot_plugin_music_bot", "Tauru-t6", "Music Together Companion", "0.6.3")
 class MusicBotPlugin(Star):
     """Own the listener task from AstrBot's plugin lifecycle."""
 

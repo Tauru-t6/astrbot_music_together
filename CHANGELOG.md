@@ -1,5 +1,16 @@
 # 更新日志
 
+## [0.6.3] / [1.3.3] - 2026-10-21
+
+### 修复（插件市场上架审核）
+
+- **日志只走 AstrBot logger**：删除了 `astrbot.api` 导入失败时回退到 Python 内置 `logging` 的分支（`logging.basicConfig` / `logging.getLogger`）。现在插件模式下 `log` 唯一来源是 `astrbot.api.logger`；独立运行（`python bot.py`）时由 `__main__` 显式注入一个只写 stderr 的轻量 logger，模块内不再 import `logging`。
+- **移除内置 HTTP 状态面板**：该服务默认监听 `0.0.0.0`、`/api/config` 无鉴权，局域网内任意主机都能热改配置（含 API key）。整块代码连同 `dashboard.html`、`dashboard_port` / `dashboard_host` 配置项一并删除，不再存在未受保护的写接口。
+- **状态文件绝不写入插件安装目录**：`set_state_path()` 原先在模块级已加载到非空 STATE 时提前 return，会让 `STATE_PATH` 停留在插件目录；现在总是采用框架给出的插件数据目录。新增 `save_state()` 守卫：数据目录尚未确定时直接跳过写入，插件模式下模块加载也不再读安装目录里的 `config.json` / `state.json`。
+
+### 说明
+
+- 状态页移除后，配置仍在 AstrBot WebUI 里改；运行状态看日志即可（弹幕/投票/进退房都有 INFO 记录）。
 ## [0.6.2] / [1.3.2] - 2026-10-20
 
 ### 修复

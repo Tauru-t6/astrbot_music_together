@@ -11,8 +11,7 @@
 - 使用 HMAC 身份令牌加入 Music Together 房间。
 - 指定房间 ID，或在没有指定房间时自动加入第一个房间。
 - 没有可加入的房间时，可自动创建一个房间。
-- 主动请求 64kbps 音频流，用 ffmpeg 统一转成单声道 MP3 后按时间切片（m4a/AAC 也能分析）。
-- 整首歌的片段在后台错峰分析，反应按歌词真正播到的时刻投放，不会提前或扎堆。
+- 下载 MP3 后按时间切成音频片段，按播放进度提前分析。
 - 播放、暂停、恢复、拖动和切歌时同步调整陪听任务。
 - 周期性请求服务端权威时钟（`player:sync_request`），防止弹幕随时间漂移。
 - 暂停时以人设口吻说一句暂停反应（每次暂停只发一次）。
@@ -104,12 +103,12 @@ Music Together Socket.IO -> 读取歌曲状态 -> 下载音频 -> MP3 切片 -> 
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
 | `segment_seconds` | `30` | 每个音频片段的长度，插件限制在 10 到 180 秒。 |
-| `analyze_lead_seconds` | `25` | 片段开播前多少秒发起该段的分析（用于错峰，不再阻塞投放）。 |
+| `analyze_lead_seconds` | `25` | 在片段开始前多少秒提交分析。 |
 | `max_reactions` | `4` | 音频不可用时最多发送多少条反应。 |
 | `persona` | 小听默认人设 | 发送给模型的反应风格提示。 |
-| `proxy` | 空 | 可选 HTTP 代理，用于模型请求和音频下载。填了但代理不可用会导致音频下载失败并退化为知识模式，留空即直连。 |
+| `proxy` | 空 | 可选 HTTP 代理，用于模型请求和音频下载。 |
 
-音频下载后统一经 ffmpeg 转码为单声道 48kbps MP3 再切片，因此 m4a/AAC 等格式同样可以分析（30 秒片段约 180KB，Gemini 通常在 4-6 秒内返回）。只有转码失败或下载失败时，插件才退化为"知识模式"：仅根据歌名、歌手和已有笔记生成反应，且会提示模型不要编造听不到的内容。
+只有 MP3 音频能被切片分析。音源是 m4a、flac 等格式，或下载失败时，插件退化为"知识模式"：仅根据歌名、歌手和已有笔记生成反应，且会提示模型不要编造听不到的内容。
 
 ### AstrBot 对话字段
 
@@ -136,7 +135,11 @@ cp config.example.json config.json
 python bot.py
 ```
 
-独立运行时，`config.json` 必须填写 `server_url`、`identity_secret`、`gemini_endpoint` 和 `gemini_key`。状态会写入同目录的 `state.json`，其中可能包含房间重连 token；请限制文件权限并避免提交到 Git。作为 AstrBot 插件运行时，状态文件保存在 AstrBot 的插件数据目录，不会写入插件目录。
+独立运行时，`config.json` 必须填写 `server_url`、`identity_secret`、`gemini_endpoint` 和 `gemini_key`。状态会写入同目录的 `state.json`，其中可能包含房间重连 token；请限制文件权限并避免提交到 Git。
+
+独立运行时日志走 stderr（`[music-bot] INFO ...`），由入口显式注入，不依赖 Python 的 `logging` 模块。作为 AstrBot 插件运行时，日志统一使用 `astrbot.api.logger`。
+
+作为 AstrBot 插件运行时，配置来自框架、状态文件固定在插件数据目录（`data/plugin_data/astrbot_plugin_music_bot/state.json`）；在框架给出数据目录之前不会写任何文件，因此绝不会写入插件安装目录。
 
 ## 隐私、费用和安全
 

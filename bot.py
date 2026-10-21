@@ -19,6 +19,7 @@ import json
 import os
 import random
 import re
+import sys
 import threading
 import time
 from pathlib import Path
@@ -32,17 +33,59 @@ try:
 except ImportError:
     from audio_split import split_mp3_seconds
 
+# The AstrBot logger is the only logger this plugin uses. Standalone runs
+# (python bot.py) inject their own logger explicitly via set_logger();
+# nothing here falls back to Python's built-in logging module.
 try:
     from astrbot.api import logger as log
-except ImportError:  # standalone mode (python bot.py)
-    import logging
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(message)s")
-    log = logging.getLogger("music-bot")
+except ImportError:  # standalone mode — __main__ injects a logger below
+    log = None
+
+
+class _StderrLogger:
+    """Minimal logger for standalone runs, without importing logging."""
+
+    def _emit(self, level: str, msg: object, *args, **kwargs) -> None:
+        try:
+            text = msg % args if args else str(msg)
+        except (TypeError, ValueError):
+            text = f"{msg} {args}" if args else str(msg)
+        print(f"[music-bot] {level} {text}", file=sys.stderr, flush=True)
+
+    def debug(self, msg, *args, **kwargs):
+        self._emit("DEBUG", msg, *args, **kwargs)
+
+    def info(self, msg, *args, **kwargs):
+        self._emit("INFO", msg, *args, **kwargs)
+
+    def warning(self, msg, *args, **kwargs):
+        self._emit("WARN", msg, *args, **kwargs)
+
+    warn = warning
+
+    def error(self, msg, *args, **kwargs):
+        self._emit("ERROR", msg, *args, **kwargs)
+
+    def exception(self, msg, *args, **kwargs):
+        self._emit("ERROR", msg, *args, **kwargs)
+
+
+def set_logger(logger) -> None:
+    """Install the logger to use (host framework, or standalone stderr)."""
+    global log
+    log = logger
 
 BASE = Path(__file__).resolve().parent
+# Standalone mode (python bot.py) reads config.json / state.json next to this
+# file and owns them. As an AstrBot plugin, config comes from the framework
+# (apply_config()) and state from the plugin data dir (set_state_path()); until
+# that path is known STATE_PATH_SET stays False and save_state() refuses to
+# write, so a plugin run can never write into the install directory.
+# True when imported by AstrBot (astrbot.api available), False for `python bot.py`.
+PLUGIN_MODE = log is not None
 CONFIG_PATH = Path(os.environ.get("MUSIC_BOT_CONFIG", BASE / "config.json"))
 STATE_PATH = Path(os.environ.get("MUSIC_BOT_STATE", BASE / "state.json"))
+STATE_PATH_SET = not PLUGIN_MODE  # standalone owns its own state file
 
 # 公益中转站会把广告拼在响应尾部，从最早的广告特征词处截断
 _AD_MARKERS = ("公益中转", "严禁倒卖", "官方域名", "zhicloud", "QQ群：")
@@ -66,12 +109,21 @@ def strip_relay_ads(text: str) -> str:
 # config / state / identity
 # ---------------------------------------------------------------------------
 
+def _warn(msg: str, *args) -> None:
+    """Warn during module import, when no logger may be installed yet."""
+    if log is not None:
+        log.warning(msg, *args)
+    else:
+        text = msg % args if args else msg
+        print(f"[music-bot] WARN {text}", file=sys.stderr, flush=True)
+
+
 def load_json(path: Path, default: dict) -> dict:
     if path.exists():
         try:
             return json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            log.warning("%s is invalid, using defaults", path.name)
+            _warn("%s is invalid, using defaults", path.name)
     return default
 
 
@@ -82,8 +134,22 @@ def save_json(path: Path, data: dict) -> None:
     tmp.replace(path)
 
 
-CFG = load_json(CONFIG_PATH, {})
-STATE = load_json(STATE_PATH, {})
+def save_state() -> None:
+    """Persist STATE, but only once the state file location is legitimate.
+
+    As an AstrBot plugin the file lives in the plugin data dir, which the
+    framework only reveals in initialize(); writing before that would land in
+    the install directory, so the write is skipped instead.
+    """
+    if not STATE_PATH_SET:
+        return
+    save_json(STATE_PATH, STATE)
+
+
+# In plugin mode nothing is read from the install directory: the framework
+# supplies config, and state waits for set_state_path().
+CFG = {} if PLUGIN_MODE else load_json(CONFIG_PATH, {})
+STATE = {} if PLUGIN_MODE else load_json(STATE_PATH, {})
 
 SERVER = CFG.get("server_url", "")
 NICKNAME = CFG.get("nickname", "小听")
@@ -128,7 +194,6 @@ CHAT_PLATFORM_ID = str(CFG.get("chat_platform_id", "Tauru"))
 
 BOT_UID = "music-bot-01"
 REPLY_ALL_CHAT = True
-DASH_PORT = 6385
 _CONTEXT = None
 
 
@@ -154,12 +219,15 @@ def identity_cookie(uid: str = BOT_UID) -> str:
 
 
 def set_state_path(path: Path) -> None:
-    """Move the state file (e.g. into the AstrBot plugin data dir) and reload it."""
-    global STATE_PATH, STATE
-    if STATE:
-        return  # already joined a room with the current state; keep it
+    """Point the state file at the plugin data dir and reload it from there.
+
+    Always takes the given path: the plugin data directory is authoritative,
+    so nothing may be left behind pointing at the install directory.
+    """
+    global STATE_PATH, STATE, STATE_PATH_SET
     STATE_PATH = Path(path)
     STATE = load_json(STATE_PATH, {})
+    STATE_PATH_SET = True
 
 
 def apply_config(config: dict) -> None:
@@ -170,7 +238,7 @@ def apply_config(config: dict) -> None:
     global OWNER_NICKNAME, AUTO_VOTE, DANMAKU_PER_SONG, IGNORE_NICKNAMES
     global REALTIME_ENABLED, REALTIME_URL, REALTIME_KEY, REALTIME_MODEL, REALTIME_VOICE, REALTIME_COMMIT_SECONDS, REALTIME_DUAL, REALTIME_MAX_PER_SONG
     global CHAT_SESSION_ID, CHAT_USER, CHAT_PLATFORM_ID
-    global REPLY_ALL_CHAT, DASH_PORT
+    global REPLY_ALL_CHAT
 
     CFG = dict(config or {})
     SERVER = str(CFG.get("server_url", "") or "").strip().rstrip("/")
@@ -205,7 +273,6 @@ def apply_config(config: dict) -> None:
     CHAT_USER = str(CFG.get("chat_user", "music-room") or "music-room")
     CHAT_PLATFORM_ID = str(CFG.get("chat_platform_id", "Tauru") or "Tauru")
     REPLY_ALL_CHAT = bool(CFG.get("reply_all_chat", True))
-    DASH_PORT = max(0, min(int(CFG.get("dashboard_port", 6385) or 6385), 65535))
 
 
 def gemini_url() -> str:
@@ -840,214 +907,6 @@ class RealtimeSession:
 
 
 # ---------------------------------------------------------------------------
-# dashboard state (read by the status page)
-# ---------------------------------------------------------------------------
-
-RECENT_EVENTS: list[dict] = []  # [{ts, kind, text, room}] newest last, capped
-
-
-def record_event(kind: str, text: str, room: str = "") -> None:
-    RECENT_EVENTS.append({"ts": time.time(), "kind": kind, "text": text, "room": room})
-    del RECENT_EVENTS[:-50]
-
-
-# Fields the dashboard is allowed to read/write. Secret values are masked in
-# GET and only replaced when the client sends a non-masked value.
-DASH_EDITABLE = {
-    "gemini_endpoint": "text",
-    "gemini_key": "secret",
-    "gemini_model": "text",
-    "segment_seconds": "float",
-    "analyze_lead_seconds": "float",
-    "persona": "text",
-    "nickname": "text",
-    "owner_nickname": "text",
-    "auto_vote": "bool",
-    "danmaku_per_song": "float",
-    "ignore_nicknames": "text",
-    "realtime_enabled": "bool",
-    "realtime_commit_seconds": "float",
-    "realtime_dual": "bool",
-    "reply_all_chat": "bool",
-    "proxy": "text",
-    "chat_session_id": "text",
-    "chat_platform_id": "text",
-    "chat_user": "text",
-}
-
-
-def _overrides_path() -> Path:
-    return STATE_PATH.with_name("dashboard_overrides.json")
-
-
-def _load_overrides() -> dict:
-    return load_json(_overrides_path(), {})
-
-
-def apply_overrides() -> None:
-    """Re-apply config with dashboard overrides layered on top."""
-    merged = dict(CFG)
-    merged.update(_load_overrides())
-    apply_config(merged)
-
-
-def dashboard_config() -> dict:
-    masked = {}
-    for key, kind in DASH_EDITABLE.items():
-        val = CFG.get(key, "")
-        if kind == "secret" and val:
-            masked[key] = "********"
-        else:
-            masked[key] = val
-    return masked
-
-
-def dashboard_update(payload: dict) -> dict:
-    """Validate + persist dashboard config overrides, then hot-apply."""
-    overrides = _load_overrides()
-    changed = {}
-    for key, kind in DASH_EDITABLE.items():
-        if key not in payload:
-            continue
-        val = payload[key]
-        if kind == "secret" and (not val or val == "********"):
-            continue  # untouched masked field
-        if kind == "float":
-            try:
-                val = float(val)
-            except (TypeError, ValueError):
-                continue
-        elif kind == "bool":
-            val = bool(val)
-        else:
-            val = str(val)
-        overrides[key] = val
-        changed[key] = val
-    save_json(_overrides_path(), overrides)
-    apply_overrides()
-    log.info("dashboard config updated: %s", sorted(changed))
-    return dashboard_config()
-
-
-async def _handle_dashboard(reader: asyncio.StreamReader,
-                            writer: asyncio.StreamWriter) -> None:
-    try:
-        request = await asyncio.wait_for(reader.read(65536), timeout=5)
-        head, _, rest = request.partition(b"\r\n\r\n")
-        line = head.split(b"\r\n", 1)[0].decode(errors="replace")
-        parts = line.split(" ")
-        method = parts[0].upper() if parts else "GET"
-        path = parts[1] if len(parts) > 1 else "/"
-
-        status = "200 OK"
-        if path.startswith("/api/status"):
-            body = json.dumps(dashboard_status(), ensure_ascii=False).encode()
-            ctype = "application/json; charset=utf-8"
-        elif path.startswith("/api/config"):
-            if method == "POST":
-                try:
-                    payload = json.loads(rest.decode("utf-8") or "{}")
-                    out = dashboard_update(payload)
-                except (json.JSONDecodeError, ValueError) as exc:
-                    status = "400 Bad Request"
-                    out = {"error": str(exc)}
-            else:
-                out = dashboard_config()
-            body = json.dumps(out, ensure_ascii=False).encode()
-            ctype = "application/json; charset=utf-8"
-        else:
-            body = _DASHBOARD_HTML.encode()
-            ctype = "text/html; charset=utf-8"
-        writer.write(
-            b"HTTP/1.1 " + status.encode() +
-            b"\r\nContent-Type: " + ctype.encode() +
-            b"\r\nContent-Length: " + str(len(body)).encode() +
-            b"\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n" + body)
-        await writer.drain()
-    except Exception:
-        pass
-    finally:
-        try:
-            writer.close()
-        except Exception:
-            pass
-
-
-_DASHBOARD_SERVER: asyncio.AbstractServer | None = None
-
-try:
-    _DASHBOARD_HTML = (BASE / "dashboard.html").read_text(encoding="utf-8")
-except OSError:
-    _DASHBOARD_HTML = "<!doctype html><title>music-bot</title><p>dashboard.html missing</p>"
-
-
-async def start_dashboard() -> None:
-    """Serve the status page on 127.0.0.1:DASH_PORT (bind-all if configured)."""
-    global _DASHBOARD_SERVER
-    if _DASHBOARD_SERVER is not None or not DASH_PORT:
-        return
-    host = str(CFG.get("dashboard_host", "0.0.0.0") or "0.0.0.0")
-    try:
-        _DASHBOARD_SERVER = await asyncio.start_server(
-            _handle_dashboard, host, DASH_PORT)
-        log.info("dashboard: http://%s:%s/", host, DASH_PORT)
-    except OSError as exc:
-        log.warning("dashboard port %s unavailable: %s", DASH_PORT, exc)
-
-
-async def stop_dashboard() -> None:
-    global _DASHBOARD_SERVER
-    if _DASHBOARD_SERVER is not None:
-        _DASHBOARD_SERVER.close()
-        await _DASHBOARD_SERVER.wait_closed()
-        _DASHBOARD_SERVER = None
-
-
-def dashboard_status() -> dict:
-    """Snapshot for the status page."""
-    bot = BOT
-    if bot is None:
-        return {
-            "connected": False, "room_id": "", "nickname": NICKNAME,
-            "owner_nickname": OWNER_NICKNAME, "server": SERVER,
-            "listening": False, "track": {}, "position": 0.0, "duration": 0.0,
-            "paused": False, "notes": [], "events": RECENT_EVENTS[-20:],
-            "now": time.time(),
-        }
-    sess = bot.session
-    track: dict = {}
-    pos = 0.0
-    dur = 0.0
-    paused = False
-    if sess:
-        track = {
-            "title": sess.track.get("title", ""),
-            "artist": "/".join(sess.track.get("artist") or []),
-            "cover": sess.track.get("coverUrl") or sess.track.get("cover") or "",
-        }
-        pos = round(sess.position(), 1)
-        dur = sess.duration
-        paused = sess.paused
-    return {
-        "connected": bool(bot.sio.connected),
-        "room_id": bot.room_id or "",
-        "room_name": bot.room_name,
-        "owner_nickname": OWNER_NICKNAME,
-        "owner_in_room": bot.owner_here,
-        "nickname": NICKNAME,
-        "server": SERVER,
-        "listening": sess is not None,
-        "track": track,
-        "position": pos,
-        "duration": dur,
-        "paused": paused,
-        "notes": list(sess.notes[-12:]) if sess else [],
-        "events": RECENT_EVENTS[-20:],
-        "now": time.time(),
-    }
-
-
-# ---------------------------------------------------------------------------
 # the bot: one socket, owner-following
 # ---------------------------------------------------------------------------
 
@@ -1303,7 +1162,7 @@ class MusicBot:
         self.room_id = room.get("id", self.room_id)
         if self.room_id:
             STATE["room_id"] = self.room_id
-            save_json(STATE_PATH, STATE)
+            save_state()
         await self._process_state(room)
 
     # -- room state ------------------------------------------------------
@@ -1320,7 +1179,7 @@ class MusicBot:
         if rid:
             self.room_id = str(rid)
             STATE["room_id"] = self.room_id
-            save_json(STATE_PATH, STATE)
+            save_state()
         self.room_name = str(room.get("name", "") or "")
         users = room.get("users") or []
         bot_nicks = {NICKNAME, *IGNORE_NICKNAMES}
@@ -1373,7 +1232,7 @@ class MusicBot:
         self.room_name = ""
         STATE.pop("room_id", None)
         STATE.pop("rejoin_token", None)
-        save_json(STATE_PATH, STATE)
+        save_state()
         if self.sio.connected and not self._stopped:
             await self.sio.emit("room:list")
 
@@ -1412,7 +1271,7 @@ class MusicBot:
         if self._stopped or self.owner_here or not self.sio.connected:
             return
         log.info("owner is gone; leaving to follow")
-        record_event("sys", f"{OWNER_NICKNAME} 离开了，bot 跟着走了", room=self.room_id)
+        log.debug("[sys] %s", f"{OWNER_NICKNAME} 离开了，bot 跟着走了")
         await self._leave_and_discover()
 
     async def _on_room_deleted(self, data: dict) -> None:
@@ -1484,7 +1343,7 @@ class MusicBot:
             await asyncio.sleep(3.5 - gap)  # 双模型并行时避免同秒双响
         self._last_post = time.time()
         log.info("chat -> %s", text[:80])
-        record_event("danmaku", text[:200], room=self.room_id)
+        log.debug("[danmaku] %s", text[:200])
         await self.sio.emit("chat:message", {"content": text[:200]})
 
     async def wait_until(self, session: ListenSession, target: float) -> bool:
@@ -1538,7 +1397,7 @@ class MusicBot:
         title = track.get("title", "?")
         artist = "/".join(track.get("artist") or [])
         log.info("listening along: %s - %s", title, artist)
-        record_event("sys", f"开始一起听《{title}》- {artist}", room=self.room_id)
+        log.debug("[sys] %s", f"开始一起听《{title}》- {artist}")
 
         audio, mime = await download_audio(track)
         segments: list[tuple[float, bytes]] = []
@@ -1768,7 +1627,7 @@ class MusicBot:
             return False
         log.info("realtime listening: %.0fs pcm (commit every %ss)",
                  len(pcm) / 32000.0, REALTIME_COMMIT_SECONDS)
-        record_event("sys", "realtime 模式陪听中", room=self.room_id)
+        log.debug("[sys] %s", "realtime 模式陪听中")
         CHUNK = 3200 * 2  # 200ms of 16k s16le
         since_commit = 0.0
         pos_bytes = 0
@@ -1937,7 +1796,7 @@ class MusicBot:
         label = VOTE_LABELS.get(action, action)
         choice = "同意" if owner_choice else "反对"
         log.info("vote %s (by %s): owner %s — following", label, by, choice)
-        record_event("sys", f"「{label}」投票：主人{choice}，bot 跟随", room=self.room_id)
+        log.debug("[sys] %s", f"「{label}」投票：主人{choice}，bot 跟随")
         if vid:
             self._voted_ids.add(vid)
             if len(self._voted_ids) > 50:
@@ -1954,14 +1813,13 @@ class MusicBot:
         label = VOTE_LABELS.get(action, action)
         outcome = "通过" if data.get("passed") else "未通过"
         log.info("vote %s: %s", label, outcome)
-        record_event("sys", f"「{label}」投票{outcome}", room=self.room_id)
+        log.debug("[sys] %s", f"「{label}」投票{outcome}")
 
 
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
     global BOT
-    apply_overrides()  # layer dashboard-saved overrides on top of base config
     if not SERVER:
         raise SystemExit("server_url missing in music-bot configuration")
     if not IDENTITY_SECRET:
@@ -1985,8 +1843,11 @@ async def shutdown() -> None:
             await bot.stop()
         except Exception:
             log.exception("music-bot shutdown failed")
-    await stop_dashboard()
 
 
 if __name__ == "__main__":
+    # Standalone entry point: AstrBot is not installed, so the logger is
+    # injected here instead of being imported from astrbot.api.
+    if log is None:
+        set_logger(_StderrLogger())
     asyncio.run(main())
